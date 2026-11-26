@@ -1,2 +1,2 @@
 -keep class org.drinkless.tdlib.** { *; }
--keep class com.teleclone.app.data.local.db.entity.** { *; }
+-keep class com.teleclone.app.data.model.** { *; }
