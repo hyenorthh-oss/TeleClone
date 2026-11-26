@@ -359,7 +359,7 @@ object TdLibManager {
             val localFile = File(file.local.path)
             if (localFile.exists() && localFile.length() > 0L) return localFile
         }
-        return runCatching { downloadMediaFile(file.id, copyToCache = false) }.getOrNull()
+        return runCatching { downloadAvatarFile(file.id) }.getOrNull()
     }
 
     suspend fun getChatMessageCountEstimate(chatId: Long): Int {
@@ -467,9 +467,9 @@ object TdLibManager {
     }
 
     /**
-     * Downloads a TDLib file waiting for completion via UpdateFile and copies it into cacheDir.
+     * Downloads an avatar file into TDLib's internal directory waiting for completion via UpdateFile.
      */
-    suspend fun downloadMediaFile(fileId: Int, copyToCache: Boolean = true): File {
+    private suspend fun downloadAvatarFile(fileId: Int): File {
         val existing = sendQuery(TdApi.GetFile(fileId))
         val completedFile = if (existing.local.isDownloadingCompleted &&
             existing.local.path.isNotBlank() &&
@@ -480,7 +480,7 @@ object TdLibManager {
             val waiter = CompletableDeferred<TdApi.File>()
             fileDownloadWaiters[fileId] = waiter
             try {
-                val triggered = sendQuery(TdApi.DownloadFile(fileId, 32, 0L, 0L, false))
+                val triggered = sendQuery(TdApi.DownloadFile(fileId, 16, 0L, 0L, false))
                 if (triggered.local.isDownloadingCompleted &&
                     triggered.local.path.isNotBlank() &&
                     File(triggered.local.path).exists()
@@ -488,7 +488,7 @@ object TdLibManager {
                     fileDownloadWaiters.remove(fileId)
                     triggered
                 } else {
-                    withTimeout(300_000L) {
+                    withTimeout(60_000L) {
                         waiter.await()
                     }
                 }
@@ -496,14 +496,7 @@ object TdLibManager {
                 fileDownloadWaiters.remove(fileId)
             }
         }
-
-        val tdFile = File(completedFile.local.path)
-        if (!copyToCache) return tdFile
-
-        val safeName = tdFile.name.ifBlank { "media_$fileId" }
-        val cachedCopy = File(appContext.cacheDir, "tc_${fileId}_$safeName")
-        tdFile.copyTo(cachedCopy, overwrite = true)
-        return cachedCopy
+        return File(completedFile.local.path)
     }
 
     fun cleanupText(text: String, stripMentions: Boolean, signature: String): String {
@@ -525,227 +518,165 @@ object TdLibManager {
         return cleaned.trim()
     }
 
-    suspend fun sendMessageClean(
-        targetChatId: Long,
-        message: TdApi.Message,
-        settings: CloneSettings,
-        onStatusUpdate: (String) -> Unit,
-    ): Boolean {
-        var tempFile: File? = null
-        try {
-            val inputContent = buildInputMessageContent(message, settings, onStatusUpdate) { file ->
-                tempFile = file
-            } ?: return false
-
-            onStatusUpdate("Enviando mensagem...")
-            val sendReq = TdApi.SendMessage().apply {
-                chatId = targetChatId
-                inputMessageContent = inputContent
-            }
-            val pendingMsg = sendQuery(sendReq)
-            awaitMessageSent(pendingMsg)
-            return true
-        } finally {
-            tempFile?.delete()
+    private fun isMessageAllowedBySettings(message: TdApi.Message, settings: CloneSettings): Boolean {
+        return when (message.content) {
+            is TdApi.MessageText -> settings.includeText
+            is TdApi.MessagePhoto -> settings.includePhotos
+            is TdApi.MessageVideo, is TdApi.MessageAnimation -> settings.includeVideos
+            is TdApi.MessageAudio, is TdApi.MessageVoiceNote -> settings.includeAudio
+            is TdApi.MessageDocument -> settings.includeDocuments
+            else -> false
         }
     }
 
-    suspend fun sendAlbumClean(
+    /**
+     * Copies messages cloud-to-cloud directly on Telegram servers without the "Forwarded from" tag
+     * using ForwardMessages(sendCopy = true, removeCaption = false).
+     */
+    suspend fun forwardCopyClean(
+        sourceChatId: Long,
         targetChatId: Long,
         messages: List<TdApi.Message>,
         settings: CloneSettings,
         onStatusUpdate: (String) -> Unit,
-    ): Boolean {
-        if (messages.size <= 1) {
-            val single = messages.firstOrNull() ?: return false
-            return sendMessageClean(targetChatId, single, settings, onStatusUpdate)
+    ): Int {
+        val allowed = messages.filter { isMessageAllowedBySettings(it, settings) }
+        if (allowed.isEmpty()) return 0
+
+        onStatusUpdate(
+            if (allowed.size > 1) "Enviando álbum..." else "Enviando mensagem..."
+        )
+
+        val sendOptions = TdApi.MessageSendOptions().apply {
+            disableNotification = false
+            fromBackground = false
+            protectContent = false
+            updateOrderOfInstalledStickerSets = false
+            schedulingState = null
+            sendingId = 0
+            onlyPreview = false
         }
 
-        val tempFiles = mutableListOf<File>()
+        val forwardReq = TdApi.ForwardMessages().apply {
+            chatId = targetChatId
+            topicId = null
+            fromChatId = sourceChatId
+            messageIds = allowed.map { it.id }.toLongArray()
+            options = sendOptions
+            sendCopy = true
+            removeCaption = false
+        }
+
+        val forwarded = sendQuery(forwardReq)
+        val copiedMessages = forwarded.messages
+            ?.filterNotNull()
+            ?.map { awaitMessageSent(it) }
+            .orEmpty()
+
+        val shouldModifyText = settings.stripMentionsAndLinks || settings.customSignature.isNotBlank()
+        if (shouldModifyText) {
+            for (copiedMsg in copiedMessages) {
+                applyTextCleanupIfNeeded(targetChatId, copiedMsg, settings)
+            }
+        }
+
+        return if (copiedMessages.isNotEmpty()) copiedMessages.size else allowed.size
+    }
+
+    private suspend fun applyTextCleanupIfNeeded(
+        targetChatId: Long,
+        copiedMsg: TdApi.Message,
+        settings: CloneSettings,
+    ) {
         try {
-            val contents = mutableListOf<TdApi.InputMessageContent>()
-            for (msg in messages) {
-                val content = buildInputMessageContent(msg, settings, onStatusUpdate) { file ->
-                    tempFiles.add(file)
-                }
-                if (content != null) {
-                    contents.add(content)
-                }
-            }
-            if (contents.isEmpty()) return false
-
-            if (contents.size == 1) {
-                onStatusUpdate("Enviando mídia...")
-                val pendingMsg = sendQuery(
-                    TdApi.SendMessage().apply {
-                        chatId = targetChatId
-                        inputMessageContent = contents.first()
+            when (val content = copiedMsg.content) {
+                is TdApi.MessageText -> {
+                    val originalText = content.text.text
+                    if (originalText.isNotBlank()) {
+                        val cleaned = cleanupText(
+                            originalText,
+                            settings.stripMentionsAndLinks,
+                            settings.customSignature,
+                        )
+                        if (cleaned.isNotBlank() && cleaned != originalText) {
+                            sendQuery(
+                                TdApi.EditMessageText().apply {
+                                    chatId = targetChatId
+                                    messageId = copiedMsg.id
+                                    replyMarkup = null
+                                    inputMessageContent = TdApi.InputMessageText().apply {
+                                        text = TdApi.FormattedText(cleaned, emptyArray())
+                                        clearDraft = true
+                                    }
+                                }
+                            )
+                        }
                     }
+                }
+                is TdApi.MessagePhoto -> editCaptionIfNeeded(
+                    targetChatId, copiedMsg.id, content.caption.text, content.showCaptionAboveMedia, settings
                 )
-                awaitMessageSent(pendingMsg)
-                return true
+                is TdApi.MessageVideo -> editCaptionIfNeeded(
+                    targetChatId, copiedMsg.id, content.caption.text, content.showCaptionAboveMedia, settings
+                )
+                is TdApi.MessageAnimation -> editCaptionIfNeeded(
+                    targetChatId, copiedMsg.id, content.caption.text, content.showCaptionAboveMedia, settings
+                )
+                is TdApi.MessageAudio -> editCaptionIfNeeded(
+                    targetChatId, copiedMsg.id, content.caption.text, false, settings
+                )
+                is TdApi.MessageVoiceNote -> editCaptionIfNeeded(
+                    targetChatId, copiedMsg.id, content.caption.text, false, settings
+                )
+                is TdApi.MessageDocument -> editCaptionIfNeeded(
+                    targetChatId, copiedMsg.id, content.caption.text, false, settings
+                )
+                else -> Unit
             }
-
-            onStatusUpdate("Enviando álbum (${contents.size} itens)...")
-            val albumReq = TdApi.SendMessageAlbum().apply {
-                chatId = targetChatId
-                inputMessageContents = contents.toTypedArray()
+        } catch (e: TdLibException) {
+            if (e.extractFloodWaitSeconds() != null) {
+                throw e
             }
-            val pendingMessages = sendQuery(albumReq)
-            pendingMessages.messages?.forEach { pending ->
-                awaitMessageSent(pending)
-            }
-            return true
-        } finally {
-            tempFiles.forEach { runCatching { it.delete() } }
+            Log.w(TAG, "Skipping post-copy text edit on message ${copiedMsg.id}: ${e.message}")
         }
     }
 
-    private suspend fun awaitMessageSent(message: TdApi.Message) {
-        if (message.sendingState == null) return
+    private suspend fun editCaptionIfNeeded(
+        targetChatId: Long,
+        messageId: Long,
+        originalCaption: String,
+        showAboveMedia: Boolean,
+        settings: CloneSettings,
+    ) {
+        if (originalCaption.isBlank()) return
+        val cleaned = cleanupText(
+            originalCaption,
+            settings.stripMentionsAndLinks,
+            settings.customSignature,
+        )
+        if (cleaned != originalCaption) {
+            sendQuery(
+                TdApi.EditMessageCaption().apply {
+                    chatId = targetChatId
+                    this.messageId = messageId
+                    replyMarkup = null
+                    caption = TdApi.FormattedText(cleaned, emptyArray())
+                    showCaptionAboveMedia = showAboveMedia
+                }
+            )
+        }
+    }
+
+    private suspend fun awaitMessageSent(message: TdApi.Message): TdApi.Message {
+        if (message.sendingState == null) return message
         val deferred = CompletableDeferred<TdApi.Message>()
         sendMessageWaiters[message.id] = deferred
-        try {
+        return try {
             withTimeout(300_000L) {
                 deferred.await()
             }
         } finally {
             sendMessageWaiters.remove(message.id)
-        }
-    }
-
-    private suspend fun buildInputMessageContent(
-        message: TdApi.Message,
-        settings: CloneSettings,
-        onStatusUpdate: (String) -> Unit,
-        onTempFileCreated: (File) -> Unit,
-    ): TdApi.InputMessageContent? {
-        return when (val content = message.content) {
-            is TdApi.MessageText -> {
-                if (!settings.includeText) return null
-                val finalText = cleanupText(
-                    content.text.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                if (finalText.isBlank()) return null
-                TdApi.InputMessageText().apply {
-                    text = TdApi.FormattedText(finalText, emptyArray())
-                    clearDraft = true
-                }
-            }
-            is TdApi.MessagePhoto -> {
-                if (!settings.includePhotos) return null
-                val bestSize = content.photo.sizes.maxByOrNull { it.width * it.height } ?: return null
-                onStatusUpdate("Baixando foto...")
-                val file = downloadMediaFile(bestSize.photo.id, copyToCache = true)
-                onTempFileCreated(file)
-                val captionText = cleanupText(
-                    content.caption.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                TdApi.InputMessagePhoto().apply {
-                    photo = TdApi.InputFileLocal(file.absolutePath)
-                    width = bestSize.width
-                    height = bestSize.height
-                    caption = TdApi.FormattedText(captionText, emptyArray())
-                    hasSpoiler = content.hasSpoiler
-                    showCaptionAboveMedia = content.showCaptionAboveMedia
-                }
-            }
-            is TdApi.MessageVideo -> {
-                if (!settings.includeVideos) return null
-                onStatusUpdate("Baixando vídeo...")
-                val file = downloadMediaFile(content.video.video.id, copyToCache = true)
-                onTempFileCreated(file)
-                val captionText = cleanupText(
-                    content.caption.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                TdApi.InputMessageVideo().apply {
-                    video = TdApi.InputFileLocal(file.absolutePath)
-                    duration = content.video.duration
-                    width = content.video.width
-                    height = content.video.height
-                    supportsStreaming = content.video.supportsStreaming
-                    caption = TdApi.FormattedText(captionText, emptyArray())
-                    hasSpoiler = content.hasSpoiler
-                    showCaptionAboveMedia = content.showCaptionAboveMedia
-                }
-            }
-            is TdApi.MessageAnimation -> {
-                if (!settings.includeVideos) return null
-                onStatusUpdate("Baixando animação...")
-                val file = downloadMediaFile(content.animation.animation.id, copyToCache = true)
-                onTempFileCreated(file)
-                val captionText = cleanupText(
-                    content.caption.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                TdApi.InputMessageAnimation().apply {
-                    animation = TdApi.InputFileLocal(file.absolutePath)
-                    duration = content.animation.duration
-                    width = content.animation.width
-                    height = content.animation.height
-                    caption = TdApi.FormattedText(captionText, emptyArray())
-                    hasSpoiler = content.hasSpoiler
-                    showCaptionAboveMedia = content.showCaptionAboveMedia
-                }
-            }
-            is TdApi.MessageAudio -> {
-                if (!settings.includeAudio) return null
-                onStatusUpdate("Baixando áudio...")
-                val file = downloadMediaFile(content.audio.audio.id, copyToCache = true)
-                onTempFileCreated(file)
-                val captionText = cleanupText(
-                    content.caption.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                TdApi.InputMessageAudio().apply {
-                    audio = TdApi.InputFileLocal(file.absolutePath)
-                    duration = content.audio.duration
-                    title = content.audio.title
-                    performer = content.audio.performer
-                    caption = TdApi.FormattedText(captionText, emptyArray())
-                }
-            }
-            is TdApi.MessageVoiceNote -> {
-                if (!settings.includeAudio) return null
-                onStatusUpdate("Baixando nota de voz...")
-                val file = downloadMediaFile(content.voiceNote.voice.id, copyToCache = true)
-                onTempFileCreated(file)
-                val captionText = cleanupText(
-                    content.caption.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                TdApi.InputMessageVoiceNote().apply {
-                    voiceNote = TdApi.InputFileLocal(file.absolutePath)
-                    duration = content.voiceNote.duration
-                    waveform = content.voiceNote.waveform
-                    caption = TdApi.FormattedText(captionText, emptyArray())
-                }
-            }
-            is TdApi.MessageDocument -> {
-                if (!settings.includeDocuments) return null
-                onStatusUpdate("Baixando documento...")
-                val file = downloadMediaFile(content.document.document.id, copyToCache = true)
-                onTempFileCreated(file)
-                val captionText = cleanupText(
-                    content.caption.text,
-                    settings.stripMentionsAndLinks,
-                    settings.customSignature,
-                )
-                TdApi.InputMessageDocument().apply {
-                    document = TdApi.InputFileLocal(file.absolutePath)
-                    caption = TdApi.FormattedText(captionText, emptyArray())
-                }
-            }
-            else -> null
         }
     }
 }

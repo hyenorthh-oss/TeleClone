@@ -231,31 +231,21 @@ class CloneForegroundService : Service() {
                     if (!serviceScope.isActive) return
 
                     val latestSettings = settingsDataStore.getCloneSettings()
-                    val sent = executeWithFloodWait(currentTask) {
-                        if (unit.size > 1) {
-                            TdLibManager.sendAlbumClean(
-                                targetChatId = currentTask.targetChatId,
-                                messages = unit,
-                                settings = latestSettings,
-                                onStatusUpdate = { detail ->
-                                    updateProgressState(currentTask, detail, null, isPaused = false)
-                                },
-                            )
-                        } else {
-                            TdLibManager.sendMessageClean(
-                                targetChatId = currentTask.targetChatId,
-                                message = unit.first(),
-                                settings = latestSettings,
-                                onStatusUpdate = { detail ->
-                                    updateProgressState(currentTask, detail, null, isPaused = false)
-                                },
-                            )
-                        }
+                    val sentCount = executeWithFloodWait(currentTask) {
+                        TdLibManager.forwardCopyClean(
+                            sourceChatId = currentTask.sourceChatId,
+                            targetChatId = currentTask.targetChatId,
+                            messages = unit,
+                            settings = latestSettings,
+                            onStatusUpdate = { detail ->
+                                updateProgressState(currentTask, detail, null, isPaused = false)
+                            },
+                        )
                     }
 
+                    val sent = sentCount > 0
                     val lastIdInUnit = unit.last().id
-                    val increment = if (sent) unit.size else 0
-                    val newCount = currentTask.clonedCount + increment
+                    val newCount = currentTask.clonedCount + sentCount
                     val now = System.currentTimeMillis()
 
                     currentTask = currentTask.copy(
