@@ -80,7 +80,7 @@ fun PerfilScreen(
             if (avatarPath != null) {
                 AsyncImage(
                     model = avatarPath,
-                    contentDescription = userProfile?.fullName,
+                    contentDescription = userProfile.fullName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(84.dp)
