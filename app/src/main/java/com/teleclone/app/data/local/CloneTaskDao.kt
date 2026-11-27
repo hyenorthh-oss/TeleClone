@@ -17,8 +17,14 @@ interface CloneTaskDao {
     fun observeAllTasks(): Flow<List<CloneTaskEntity>>
 
     @Query(
-        "SELECT * FROM clone_tasks WHERE status IN ('${CloneTaskStatus.RUNNING}', '${CloneTaskStatus.PAUSED}') " +
-            "ORDER BY updatedAt DESC LIMIT 1"
+        "SELECT * FROM clone_tasks WHERE status IN (" +
+            "'${CloneTaskStatus.SCANNING}', " +
+            "'${CloneTaskStatus.RUNNING}', " +
+            "'${CloneTaskStatus.VERIFYING}', " +
+            "'${CloneTaskStatus.PAUSED}', " +
+            "'${CloneTaskStatus.COMPLETED}', " +
+            "'${CloneTaskStatus.ERROR}'" +
+            ") ORDER BY updatedAt DESC LIMIT 1"
     )
     fun observeActiveTask(): Flow<CloneTaskEntity?>
 
@@ -48,6 +54,20 @@ interface CloneTaskDao {
         taskId: Long,
         lastClonedMessageId: Long,
         clonedCount: Int,
+        updatedAt: Long,
+    )
+
+    @Query(
+        "UPDATE clone_tasks SET clonedCount = :clonedCount, failedPermanentCount = :failedCount, " +
+            "lastFailureReason = :lastFailureReason, lastClonedMessageId = :lastClonedMessageId, " +
+            "updatedAt = :updatedAt WHERE id = :taskId"
+    )
+    suspend fun updateDetailedProgress(
+        taskId: Long,
+        lastClonedMessageId: Long,
+        clonedCount: Int,
+        failedCount: Int,
+        lastFailureReason: String,
         updatedAt: Long,
     )
 

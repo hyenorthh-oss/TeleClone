@@ -70,11 +70,11 @@ class BatchModeValidatorTest {
     }
 
     @Test
-    fun `invalid jitter bounds zero negative and max less than min are rejected`() {
+    fun `invalid jitter bounds negative and max less than min are rejected while min zero is allowed`() {
         val base = validAllProtectionsConfig()
 
-        val zeroMin = base.copy(jitterMinText = "0", jitterMaxText = "8")
-        assertFalse(BatchModeValidator.validate(zeroMin).isValid)
+        val zeroMin = base.copy(jitterMinText = "0", jitterMaxText = "5")
+        assertTrue(BatchModeValidator.validate(zeroMin).isValid)
 
         val negativeMin = base.copy(jitterMinText = "-2", jitterMaxText = "8")
         assertFalse(BatchModeValidator.validate(negativeMin).isValid)
@@ -104,9 +104,14 @@ class BatchModeValidatorTest {
     }
 
     @Test
-    fun `start button stays disabled when task is already running or source target invalid`() {
+    fun `start button stays disabled while active or waiting completed confirmation`() {
         val valid = validAllProtectionsConfig()
         assertFalse(BatchModeValidator.canStartCloning(hasValidSourceAndTarget = false, isTaskRunning = false, config = valid))
         assertFalse(BatchModeValidator.canStartCloning(hasValidSourceAndTarget = true, isTaskRunning = true, config = valid))
+
+        listOf(CloneTaskStatus.SCANNING, CloneTaskStatus.RUNNING, CloneTaskStatus.VERIFYING).forEach { status ->
+            assertTrue(CloneTaskStatus.isActiveOrRunning(status))
+        }
+        assertFalse(CloneTaskStatus.isActiveOrRunning(CloneTaskStatus.COMPLETED))
     }
 }

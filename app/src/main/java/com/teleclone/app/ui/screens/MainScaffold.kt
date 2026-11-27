@@ -180,6 +180,7 @@ fun MainScaffold(viewModel: MainViewModel) {
                     onPauseCloning = { context -> viewModel.pauseCloning(context) },
                     onResumeCloning = { context, taskId -> viewModel.resumeCloning(context, taskId) },
                     onCancelCloning = { context -> viewModel.cancelCloning(context) },
+                    onAcknowledgeCompleted = { context -> viewModel.acknowledgeCompletedTask(context) },
                 )
                 2 -> ConfiguracoesScreen(
                     settings = cloneSettings,

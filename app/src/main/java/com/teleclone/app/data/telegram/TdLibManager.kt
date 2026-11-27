@@ -28,6 +28,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.ceil
 
 class TdLibException(
     val code: Int,
@@ -46,16 +47,11 @@ class TdLibException(
     }
 }
 
-data class HistoryBatchResult(
-    val messages: List<TdApi.Message>,
-    val maxScannedMessageId: Long,
-    val isProtectedChat: Boolean = false,
-)
-
 object TdLibManager {
 
     private const val TAG = "TdLibManager"
     private const val QUERY_TIMEOUT_MS = CloneReliabilityExecutor.DEFAULT_TIMEOUT_MS
+    private const val MAX_EVENT_CACHE_SIZE = 2000
 
     private lateinit var appContext: Context
     private lateinit var settingsDataStore: SettingsDataStore
@@ -69,6 +65,8 @@ object TdLibManager {
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
     private val fileDownloadWaiters = ConcurrentHashMap<Int, CompletableDeferred<TdApi.File>>()
+    private val sendSucceededEvents = ConcurrentHashMap<Long, TdApi.Message>()
+    private val sendFailedEvents = ConcurrentHashMap<Long, DispatchedSendingState.Failed>()
 
     @Volatile
     private var waitingTdlibParameters = false
@@ -97,6 +95,25 @@ object TdLibManager {
                 if (file.local.isDownloadingCompleted && file.local.path.isNotBlank()) {
                     fileDownloadWaiters.remove(file.id)?.complete(file)
                 }
+            }
+            is TdApi.UpdateMessageSendSucceeded -> {
+                if (sendSucceededEvents.size > MAX_EVENT_CACHE_SIZE) {
+                    sendSucceededEvents.clear()
+                }
+                sendSucceededEvents[update.oldMessageId] = update.message
+            }
+            is TdApi.UpdateMessageSendFailed -> {
+                if (sendFailedEvents.size > MAX_EVENT_CACHE_SIZE) {
+                    sendFailedEvents.clear()
+                }
+                val retryAfterSec = update.error?.message?.let { msg ->
+                    TdLibException(update.error.code, msg).extractFloodWaitSeconds()
+                }
+                sendFailedEvents[update.oldMessageId] = DispatchedSendingState.Failed(
+                    errorCode = update.error?.code ?: 500,
+                    errorMessage = update.error?.message ?: "Falha no envio",
+                    retryAfterSeconds = retryAfterSec,
+                )
             }
         }
     }
@@ -370,106 +387,6 @@ object TdLibManager {
         return runCatching { downloadAvatarFile(file.id) }.getOrNull()
     }
 
-    suspend fun getChatMessageCountEstimate(chatId: Long): Int {
-        return runCatching {
-            sendQueryWithTimeout(
-                TdApi.GetChatMessageCount(
-                    chatId,
-                    null,
-                    TdApi.SearchMessagesFilterEmpty(),
-                    false,
-                )
-            ).count
-        }.getOrDefault(0)
-    }
-
-    /**
-     * Fetches chronological messages strictly after [fromMessageId], continuing across page
-     * boundaries if the last message of a page belongs to an album (`mediaAlbumId != 0L`)
-     * or until [desiredForwardableCount] is reached.
-     *
-     * Respects platform content protection permissions and skips non-forwardable system messages.
-     */
-    suspend fun fetchHistoryBatch(
-        chatId: Long,
-        fromMessageId: Long,
-        desiredForwardableCount: Int = 50,
-    ): HistoryBatchResult {
-        val paginated = HistoryPagePaginator.fetchBatch(
-            fromMessageId = fromMessageId,
-            desiredForwardableCount = desiredForwardableCount,
-            isChatProtected = {
-                val chat = sendQueryWithTimeout(TdApi.GetChat(chatId))
-                if (chat.hasProtectedContent) {
-                    Log.w(TAG, "Source chat $chatId has protected content; skipping forward.")
-                    true
-                } else {
-                    false
-                }
-            },
-            fetchPage = { cursorId, limit ->
-                val result = sendQueryWithTimeout(
-                    TdApi.GetChatHistory(
-                        chatId,
-                        cursorId,
-                        -limit,
-                        limit,
-                        false,
-                    )
-                )
-                result.messages?.toList().orEmpty().map { toCloneableMessage(it) }
-            },
-            fetchOldestFallback = { limit ->
-                fetchOldestMessagesFallback(chatId, limit).map { toCloneableMessage(it) }
-            },
-        )
-        return HistoryBatchResult(
-            messages = paginated.messages.map { it.payload },
-            maxScannedMessageId = paginated.maxScannedMessageId,
-            isProtectedChat = paginated.isProtectedChat,
-        )
-    }
-
-    private suspend fun fetchOldestMessagesFallback(chatId: Long, limit: Int): List<TdApi.Message> {
-        var walkFrom = 0L
-        var oldestBatch: List<TdApi.Message> = emptyList()
-        var steps = 0
-        while (steps < 200) {
-            steps++
-            val res = sendQueryWithTimeout(TdApi.GetChatHistory(chatId, walkFrom, 0, limit, false))
-            val list = res.messages?.toList().orEmpty()
-            if (list.isEmpty()) break
-            oldestBatch = list
-            val minId = list.minOf { it.id }
-            if (minId == walkFrom) break
-            walkFrom = minId
-        }
-        return oldestBatch
-    }
-
-    fun toCloneableMessage(msg: TdApi.Message): CloneableMessage<TdApi.Message> {
-        val type = when (msg.content) {
-            is TdApi.MessageText -> CloneMessageType.TEXT
-            is TdApi.MessagePhoto -> CloneMessageType.PHOTO
-            is TdApi.MessageVideo -> CloneMessageType.VIDEO
-            is TdApi.MessageAudio -> CloneMessageType.AUDIO
-            is TdApi.MessageDocument -> CloneMessageType.DOCUMENT
-            is TdApi.MessageVoiceNote -> CloneMessageType.VOICE_NOTE
-            is TdApi.MessageAnimation -> CloneMessageType.ANIMATION
-            else -> CloneMessageType.UNSUPPORTED
-        }
-        return CloneableMessage(
-            id = msg.id,
-            mediaAlbumId = msg.mediaAlbumId,
-            canBeSaved = msg.canBeSaved,
-            type = type,
-            payload = msg,
-        )
-    }
-
-    /**
-     * Downloads an avatar file into TDLib's internal directory waiting for completion via UpdateFile.
-     */
     private suspend fun downloadAvatarFile(fileId: Int): File {
         val existing = sendQueryWithTimeout(TdApi.GetFile(fileId))
         val completedFile = if (existing.local.isDownloadingCompleted &&
@@ -500,6 +417,55 @@ object TdLibManager {
         return File(completedFile.local.path)
     }
 
+    suspend fun getChatMessageCountEstimate(chatId: Long): Int {
+        return runCatching {
+            sendQueryWithTimeout(
+                TdApi.GetChatMessageCount(
+                    chatId,
+                    null,
+                    TdApi.SearchMessagesFilterEmpty(),
+                    false,
+                )
+            ).count
+        }.getOrDefault(0)
+    }
+
+    fun extractThreadId(topicId: TdApi.MessageTopic?): Long = when (topicId) {
+        is TdApi.MessageTopicForum -> topicId.forumTopicId.toLong()
+        is TdApi.MessageTopicThread -> topicId.messageThreadId
+        else -> 0L
+    }
+
+    fun toTargetTopic(targetIsForum: Boolean, targetThreadId: Long): TdApi.MessageTopic? =
+        if (targetIsForum && targetThreadId > 0L) TdApi.MessageTopicForum(targetThreadId.toInt()) else null
+
+    fun toCloneableMessage(msg: TdApi.Message): CloneableMessage<TdApi.Message> {
+        val type = when (val content = msg.content) {
+            is TdApi.MessageText -> CloneMessageType.TEXT
+            is TdApi.MessagePhoto -> CloneMessageType.PHOTO
+            is TdApi.MessageVideo -> CloneMessageType.VIDEO
+            is TdApi.MessageAudio -> CloneMessageType.AUDIO
+            is TdApi.MessageDocument -> {
+                if (CloneBatchPlanner.isVideoDocument(content.document.mimeType, content.document.fileName)) {
+                    CloneMessageType.VIDEO
+                } else {
+                    CloneMessageType.DOCUMENT
+                }
+            }
+            is TdApi.MessageVoiceNote -> CloneMessageType.VOICE_NOTE
+            is TdApi.MessageAnimation -> CloneMessageType.ANIMATION
+            else -> CloneMessageType.UNSUPPORTED
+        }
+        return CloneableMessage(
+            id = msg.id,
+            mediaAlbumId = msg.mediaAlbumId,
+            canBeSaved = msg.canBeSaved,
+            type = type,
+            payload = msg,
+            originThreadId = extractThreadId(msg.topicId),
+        )
+    }
+
     fun cleanupText(text: String, stripMentions: Boolean, signature: String): String {
         var cleaned = text
         if (stripMentions) {
@@ -519,65 +485,326 @@ object TdLibManager {
         return cleaned.trim()
     }
 
-    /**
-     * Copies messages cloud-to-cloud directly on Telegram servers without the "Forwarded from" tag
-     * using `ForwardMessages(sendCopy = true, removeCaption = false)` with a 25s timeout.
-     *
-     * Never blocks waiting indefinitely for `UpdateMessageSendSucceeded` on album items:
-     * as soon as `TdApi.Messages` returns without error, all items are accounted for immediately.
-     */
-    suspend fun forwardCopyClean(
-        sourceChatId: Long,
-        targetChatId: Long,
-        messages: List<TdApi.Message>,
-        settings: CloneSettings,
-        onStatusUpdate: (String) -> Unit,
-    ): Int {
-        if (messages.isEmpty()) return 0
-
-        onStatusUpdate(
-            when {
-                messages.size > 10 -> "Enviando bloco (${messages.size} msgs)..."
-                messages.size > 1 -> "Enviando álbum (${messages.size} itens)..."
-                else -> "Enviando mensagem..."
+    fun createExecutionGateway(): CloneExecutionGateway<TdApi.Message> {
+        val reuploadTransport = object : ProtectedReuploadTransport {
+            override suspend fun downloadFile(fileId: Int, timeoutMs: Long): DownloadedLocalMedia {
+                val file = sendQueryWithTimeout(
+                    TdApi.DownloadFile(fileId, 32, 0L, 0L, true),
+                    timeoutMs = timeoutMs,
+                )
+                val path = file.local.path
+                if (!file.local.isDownloadingCompleted || path.isBlank()) {
+                    throw TdLibException(500, "Falha ao baixar arquivo $fileId para reenvio")
+                }
+                return DownloadedLocalMedia(fileId = file.id, localPath = path)
             }
-        )
 
-        val sendOptions = TdApi.MessageSendOptions().apply {
-            disableNotification = false
-            fromBackground = false
-            protectContent = false
-            updateOrderOfInstalledStickerSets = false
-            schedulingState = null
-            sendingId = 0
-            onlyPreview = false
+            override suspend fun deleteFile(fileId: Int) {
+                runCatching {
+                    sendQueryWithTimeout(TdApi.DeleteFile(fileId), timeoutMs = 10_000L)
+                }
+            }
+
+            override suspend fun sendSingleMessage(
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                content: TdApi.InputMessageContent,
+            ): TdApi.Message {
+                val options = defaultSendOptions()
+                return sendQueryWithTimeout(
+                    TdApi.SendMessage(
+                        targetChatId,
+                        toTargetTopic(targetIsForum, targetThreadId),
+                        null,
+                        options,
+                        null,
+                        content,
+                    )
+                )
+            }
+
+            override suspend fun sendAlbumMessages(
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                contents: List<TdApi.InputMessageContent>,
+            ): List<TdApi.Message?> {
+                val options = defaultSendOptions()
+                val res = sendQueryWithTimeout(
+                    TdApi.SendMessageAlbum(
+                        targetChatId,
+                        toTargetTopic(targetIsForum, targetThreadId),
+                        null,
+                        options,
+                        contents.toTypedArray(),
+                    )
+                )
+                return res.messages?.toList().orEmpty()
+            }
         }
 
-        val forwardReq = TdApi.ForwardMessages().apply {
-            chatId = targetChatId
-            topicId = null
-            fromChatId = sourceChatId
-            messageIds = messages.map { it.id }.toLongArray()
-            options = sendOptions
-            sendCopy = true
-            removeCaption = false
-        }
+        return object : CloneExecutionGateway<TdApi.Message> {
 
-        val forwarded = sendQueryWithTimeout(forwardReq, QUERY_TIMEOUT_MS)
-        val copiedMessages = forwarded.messages
-            ?.filterNotNull()
-            .orEmpty()
+            override suspend fun isForumSupergroup(chatId: Long): Boolean {
+                val chat = sendQueryWithTimeout(TdApi.GetChat(chatId))
+                val type = chat.type
+                if (type is TdApi.ChatTypeSupergroup) {
+                    val sg = sendQueryWithTimeout(TdApi.GetSupergroup(type.supergroupId))
+                    return sg.isForum
+                }
+                return false
+            }
 
-        val shouldModifyText = settings.stripMentionsAndLinks || settings.customSignature.isNotBlank()
-        if (shouldModifyText) {
-            for (copiedMsg in copiedMessages) {
-                if (copiedMsg.sendingState == null && copiedMsg.id > 0L) {
+            override suspend fun listForumTopics(chatId: Long): List<ForumTopicDescriptor> {
+                val topics = mutableListOf<ForumTopicDescriptor>()
+                var offsetDate = 0
+                var offsetMsgId = 0L
+                var offsetTopicId = 0
+                var pages = 0
+
+                while (pages < 50) {
+                    pages++
+                    val res = sendQueryWithTimeout(
+                        TdApi.GetForumTopics(chatId, "", offsetDate, offsetMsgId, offsetTopicId, 100)
+                    )
+                    val list = res.topics?.toList().orEmpty()
+                    if (list.isEmpty()) break
+
+                    for (ft in list) {
+                        val info = ft.info ?: continue
+                        topics.add(
+                            ForumTopicDescriptor(
+                                threadId = info.forumTopicId.toLong(),
+                                name = info.name.orEmpty(),
+                                iconColor = info.icon?.color ?: 0,
+                                iconCustomEmojiId = info.icon?.customEmojiId ?: 0L,
+                                isGeneral = info.isGeneral,
+                            )
+                        )
+                    }
+
+                    if (res.nextOffsetForumTopicId == 0 && res.nextOffsetDate == 0 && res.nextOffsetMessageId == 0L) {
+                        break
+                    }
+                    if (res.nextOffsetForumTopicId == offsetTopicId &&
+                        res.nextOffsetDate == offsetDate &&
+                        res.nextOffsetMessageId == offsetMsgId
+                    ) {
+                        break
+                    }
+                    offsetDate = res.nextOffsetDate
+                    offsetMsgId = res.nextOffsetMessageId
+                    offsetTopicId = res.nextOffsetForumTopicId
+                }
+
+                return topics.distinctBy { it.threadId }
+            }
+
+            override suspend fun createForumTopic(
+                chatId: Long,
+                topic: ForumTopicDescriptor,
+            ): ForumTopicDescriptor {
+                val icon = TdApi.ForumTopicIcon(
+                    topic.iconColor.takeIf { it != 0 } ?: 0x6FB9F0,
+                    topic.iconCustomEmojiId,
+                )
+                val created = sendQueryWithTimeout(
+                    TdApi.CreateForumTopic(
+                        chatId,
+                        topic.name.ifBlank { "Tópico" }.take(128),
+                        false,
+                        icon,
+                    )
+                )
+                return ForumTopicDescriptor(
+                    threadId = created.forumTopicId.toLong(),
+                    name = created.name.orEmpty(),
+                    iconColor = created.icon?.color ?: 0,
+                    iconCustomEmojiId = created.icon?.customEmojiId ?: 0L,
+                    isGeneral = created.isGeneral,
+                )
+            }
+
+            override suspend fun fetchHistoryPage(
+                chatId: Long,
+                fromMessageId: Long,
+                limit: Int,
+            ): List<CloneableMessage<TdApi.Message>> {
+                val res = sendQueryWithTimeout(
+                    TdApi.GetChatHistory(chatId, fromMessageId, 0, limit.coerceIn(1, 100), false)
+                )
+                return res.messages?.filterNotNull().orEmpty().map { toCloneableMessage(it) }
+            }
+
+            override suspend fun searchChatMessages(
+                chatId: Long,
+                filter: SearchFilterKind,
+                fromMessageId: Long,
+                limit: Int,
+            ): SearchPageResult<TdApi.Message> {
+                val tdFilter = when (filter) {
+                    SearchFilterKind.VIDEO -> TdApi.SearchMessagesFilterVideo()
+                    SearchFilterKind.PHOTO -> TdApi.SearchMessagesFilterPhoto()
+                    SearchFilterKind.DOCUMENT -> TdApi.SearchMessagesFilterDocument()
+                    SearchFilterKind.AUDIO -> TdApi.SearchMessagesFilterAudio()
+                }
+                val res = sendQueryWithTimeout(
+                    TdApi.SearchChatMessages(
+                        chatId,
+                        null,
+                        "",
+                        null,
+                        fromMessageId,
+                        0,
+                        limit.coerceIn(1, 100),
+                        tdFilter,
+                    )
+                )
+                val msgs = res.messages?.filterNotNull().orEmpty().map { toCloneableMessage(it) }
+                return SearchPageResult(
+                    messages = msgs,
+                    nextFromMessageId = res.nextFromMessageId,
+                )
+            }
+
+            override suspend fun isChatProtected(chatId: Long): Boolean {
+                val chat = sendQueryWithTimeout(TdApi.GetChat(chatId))
+                return chat.hasProtectedContent
+            }
+
+            override suspend fun getMessage(chatId: Long, messageId: Long): CloneableMessage<TdApi.Message>? {
+                return try {
+                    val msg = sendQueryWithTimeout(TdApi.GetMessage(chatId, messageId))
+                    toCloneableMessage(msg)
+                } catch (e: TdLibException) {
+                    if (e.code == 404) null else throw e
+                }
+            }
+
+            override suspend fun canForwardMessage(chatId: Long, message: CloneableMessage<TdApi.Message>): Boolean {
+                return runCatching {
+                    val props = sendQueryWithTimeout(TdApi.GetMessageProperties(chatId, message.id))
+                    props.canBeForwarded && props.canBeCopied
+                }.getOrDefault(message.canBeSaved)
+            }
+
+            override suspend fun forwardMessages(
+                sourceChatId: Long,
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                messages: List<CloneableMessage<TdApi.Message>>,
+            ): List<DispatchedItemHandle> {
+                val forwardReq = TdApi.ForwardMessages().apply {
+                    chatId = targetChatId
+                    topicId = toTargetTopic(targetIsForum, targetThreadId)
+                    fromChatId = sourceChatId
+                    messageIds = messages.map { it.id }.toLongArray()
+                    options = defaultSendOptions()
+                    sendCopy = true
+                    removeCaption = false
+                }
+                val forwarded = sendQueryWithTimeout(forwardReq, QUERY_TIMEOUT_MS)
+                val destMessages = forwarded.messages
+
+                return messages.mapIndexed { idx, src ->
+                    val dest = destMessages?.getOrNull(idx)
+                    if (dest == null) {
+                        DispatchedItemHandle(
+                            sourceMessageId = src.id,
+                            targetMessageId = 0L,
+                            sendingState = DispatchedSendingState.Failed(400, "CHAT_FORWARDS_RESTRICTED"),
+                            isRestrictedOrNull = true,
+                        )
+                    } else {
+                        ProtectedContentReuploader.toDispatchedHandle(src.id, dest)
+                    }
+                }
+            }
+
+            override suspend fun applyPostCopyTextCleanup(
+                targetChatId: Long,
+                handles: List<DispatchedItemHandle>,
+                settings: CloneSettings,
+            ) {
+                for (handle in handles) {
+                    if (handle.targetMessageId <= 0L || handle.sendingState !is DispatchedSendingState.Confirmed) {
+                        continue
+                    }
+                    val copiedMsg = runCatching {
+                        sendQueryWithTimeout(TdApi.GetMessage(targetChatId, handle.targetMessageId))
+                    }.getOrNull() ?: continue
                     applyTextCleanupIfNeeded(targetChatId, copiedMsg, settings)
                 }
             }
-        }
 
-        return if (copiedMessages.isNotEmpty()) copiedMessages.size else messages.size
+            override suspend fun checkDispatchedMessageState(
+                targetChatId: Long,
+                targetMessageId: Long,
+            ): DispatchedSendingState {
+                sendSucceededEvents.remove(targetMessageId)?.let {
+                    return DispatchedSendingState.Confirmed
+                }
+                sendFailedEvents.remove(targetMessageId)?.let {
+                    return it
+                }
+
+                return try {
+                    val msg = sendQueryWithTimeout(TdApi.GetMessage(targetChatId, targetMessageId))
+                    when (val sending = msg.sendingState) {
+                        null -> DispatchedSendingState.Confirmed
+                        is TdApi.MessageSendingStatePending -> DispatchedSendingState.Pending
+                        is TdApi.MessageSendingStateFailed -> {
+                            val retrySec = sending.retryAfter.takeIf { it > 0.0 }?.let { ceil(it).toInt() }
+                            DispatchedSendingState.Failed(
+                                errorCode = sending.error?.code ?: 500,
+                                errorMessage = sending.error?.message ?: "Falha no envio",
+                                retryAfterSeconds = retrySec,
+                            )
+                        }
+                        else -> DispatchedSendingState.Pending
+                    }
+                } catch (e: TdLibException) {
+                    if (e.code == 404) {
+                        sendSucceededEvents.remove(targetMessageId)?.let {
+                            return DispatchedSendingState.Confirmed
+                        }
+                        sendFailedEvents.remove(targetMessageId)?.let {
+                            return it
+                        }
+                    }
+                    throw e
+                }
+            }
+
+            override suspend fun reuploadProtectedItems(
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                items: List<CloneableMessage<TdApi.Message>>,
+                settings: CloneSettings,
+            ): List<DispatchedItemHandle> {
+                return ProtectedContentReuploader.reuploadItems(
+                    targetChatId = targetChatId,
+                    targetThreadId = targetThreadId,
+                    targetIsForum = targetIsForum,
+                    items = items,
+                    settings = settings,
+                    transport = reuploadTransport,
+                )
+            }
+        }
+    }
+
+    private fun defaultSendOptions(): TdApi.MessageSendOptions = TdApi.MessageSendOptions().apply {
+        disableNotification = false
+        fromBackground = false
+        protectContent = false
+        updateOrderOfInstalledStickerSets = false
+        schedulingState = null
+        sendingId = 0
+        onlyPreview = false
     }
 
     private suspend fun applyTextCleanupIfNeeded(

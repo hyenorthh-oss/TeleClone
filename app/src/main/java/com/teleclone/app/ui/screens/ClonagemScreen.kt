@@ -27,7 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ArrowForward
+import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
@@ -46,6 +46,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -123,6 +124,7 @@ fun ClonagemScreen(
     onPauseCloning: (Context) -> Unit,
     onResumeCloning: (Context, Long) -> Unit,
     onCancelCloning: (Context) -> Unit,
+    onAcknowledgeCompleted: (Context) -> Unit,
 ) {
     val context = LocalContext.current
 
@@ -137,7 +139,9 @@ fun ClonagemScreen(
     }
 
     val displayedTask = serviceProgress.activeTask ?: activeDbTask
-    val isTaskRunning = displayedTask?.status == CloneTaskStatus.RUNNING
+    val isTaskBlocking = displayedTask != null &&
+        (CloneTaskStatus.isActiveOrRunning(displayedTask.status) ||
+            displayedTask.status == CloneTaskStatus.COMPLETED)
 
     val visibleChats = remember(chats, selectionMode, searchQuery) {
         val byPermission = if (selectionMode == SelectionMode.TARGET) {
@@ -226,29 +230,20 @@ fun ClonagemScreen(
 
         if (!batchConfig.isBatchMode) {
             // ==================== MODO PADRÃO ====================
-            if (displayedTask != null &&
-                (displayedTask.status == CloneTaskStatus.RUNNING ||
-                    displayedTask.status == CloneTaskStatus.PAUSED ||
-                    displayedTask.status == CloneTaskStatus.ERROR)
-            ) {
-                ActiveClonePanel(
+            if (displayedTask != null && displayedTask.status != CloneTaskStatus.ARCHIVED) {
+                ActiveOrCompletedPanel(
                     task = displayedTask,
-                    statusText = serviceProgress.statusMessage.ifBlank {
-                        when (displayedTask.status) {
-                            CloneTaskStatus.PAUSED -> "Clonagem pausada"
-                            CloneTaskStatus.ERROR -> "Erro durante a clonagem"
-                            else -> "Sincronizando..."
-                        }
-                    },
+                    statusText = serviceProgress.statusMessage,
                     isFloodWait = serviceProgress.floodWaitSeconds != null,
                     onPauseResume = {
-                        if (displayedTask.status == CloneTaskStatus.RUNNING) {
+                        if (CloneTaskStatus.isActiveOrRunning(displayedTask.status)) {
                             onPauseCloning(context)
                         } else {
                             onResumeCloning(context, displayedTask.id)
                         }
                     },
                     onCancel = { onCancelCloning(context) },
+                    onAcknowledgeCompleted = { onAcknowledgeCompleted(context) },
                 )
                 Spacer(modifier = Modifier.height(12.dp))
             }
@@ -304,30 +299,21 @@ fun ClonagemScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 contentPadding = PaddingValues(bottom = 8.dp),
             ) {
-                if (displayedTask != null &&
-                    (displayedTask.status == CloneTaskStatus.RUNNING ||
-                        displayedTask.status == CloneTaskStatus.PAUSED ||
-                        displayedTask.status == CloneTaskStatus.ERROR)
-                ) {
+                if (displayedTask != null && displayedTask.status != CloneTaskStatus.ARCHIVED) {
                     item(key = "active_clone_panel", contentType = "panel") {
-                        ActiveClonePanel(
+                        ActiveOrCompletedPanel(
                             task = displayedTask,
-                            statusText = serviceProgress.statusMessage.ifBlank {
-                                when (displayedTask.status) {
-                                    CloneTaskStatus.PAUSED -> "Clonagem pausada"
-                                    CloneTaskStatus.ERROR -> "Erro durante a clonagem"
-                                    else -> "Sincronizando..."
-                                }
-                            },
+                            statusText = serviceProgress.statusMessage,
                             isFloodWait = serviceProgress.floodWaitSeconds != null,
                             onPauseResume = {
-                                if (displayedTask.status == CloneTaskStatus.RUNNING) {
+                                if (CloneTaskStatus.isActiveOrRunning(displayedTask.status)) {
                                     onPauseCloning(context)
                                 } else {
                                     onResumeCloning(context, displayedTask.id)
                                 }
                             },
                             onCancel = { onCancelCloning(context) },
+                            onAcknowledgeCompleted = { onAcknowledgeCompleted(context) },
                         )
                     }
                 }
@@ -407,7 +393,7 @@ fun ClonagemScreen(
 
         val canStart = BatchModeValidator.canStartCloning(
             hasValidSourceAndTarget = hasValidPair,
-            isTaskRunning = isTaskRunning,
+            isTaskRunning = isTaskBlocking,
             config = batchConfig,
             validation = batchValidation,
         )
@@ -434,11 +420,207 @@ fun ClonagemScreen(
                 .height(52.dp),
         ) {
             Text(
-                text = if (isTaskRunning) "Clonagem em andamento" else "Começar Clonagem",
+                text = when {
+                    displayedTask?.status == CloneTaskStatus.COMPLETED -> "Clique em Concluído acima"
+                    isTaskBlocking -> "Clonagem em andamento"
+                    else -> "Começar Clonagem"
+                },
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
             )
         }
+    }
+}
+
+@Composable
+private fun ActiveOrCompletedPanel(
+    task: CloneTaskEntity,
+    statusText: String,
+    isFloodWait: Boolean,
+    onPauseResume: () -> Unit,
+    onCancel: () -> Unit,
+    onAcknowledgeCompleted: () -> Unit,
+) {
+    if (task.status == CloneTaskStatus.COMPLETED) {
+        CompletedSummaryPanel(
+            task = task,
+            onAcknowledgeCompleted = onAcknowledgeCompleted,
+        )
+    } else {
+        ActiveClonePanel(
+            task = task,
+            statusText = statusText.ifBlank {
+                when (task.status) {
+                    CloneTaskStatus.SCANNING -> "Contabilizando arquivos e tópicos do canal de origem..."
+                    CloneTaskStatus.VERIFYING -> "Verificando integridade e repescando faltantes..."
+                    CloneTaskStatus.PAUSED -> "Clonagem pausada"
+                    CloneTaskStatus.ERROR -> task.lastFailureReason.ifBlank { "Erro durante a clonagem" }
+                    else -> "Sincronizando..."
+                }
+            },
+            isFloodWait = isFloodWait,
+            onPauseResume = onPauseResume,
+            onCancel = onCancel,
+        )
+    }
+}
+
+@Composable
+private fun CompletedSummaryPanel(
+    task: CloneTaskEntity,
+    onAcknowledgeCompleted: () -> Unit,
+) {
+    val totalInOrigin = task.totalFound + task.filteredSkippedCount
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(SurfaceCard)
+            .border(1.dp, AccentRed, RoundedCornerShape(16.dp))
+            .padding(16.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.CheckCircle,
+                contentDescription = null,
+                tint = StatusSuccess,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = "Clonagem Concluída!",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                color = TextPrimary,
+            )
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = task.sourceTitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.ArrowForward,
+                contentDescription = null,
+                tint = AccentRed,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = task.targetTitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        LinearProgressIndicator(
+            progress = { 1f },
+            color = AccentRed,
+            trackColor = SurfaceElevated,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(RoundedCornerShape(3.dp)),
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(SurfaceElevated)
+                .border(1.dp, BorderSubtle, RoundedCornerShape(12.dp))
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            SummaryMetricRow("Total contabilizado na origem", totalInOrigin.toString(), TextPrimary)
+            SummaryMetricRow("Entregues e confirmados", task.clonedCount.toString(), StatusSuccess)
+            SummaryMetricRow("Ignorados por filtro", task.filteredSkippedCount.toString(), TextSecondary)
+            SummaryMetricRow(
+                "Falhas/Bloqueados permanentes",
+                task.failedPermanentCount.toString(),
+                if (task.failedPermanentCount > 0) AccentRed else TextSecondary,
+            )
+            if (task.topicCount > 0) {
+                SummaryMetricRow("Tópicos mapeados", task.topicCount.toString(), TextSecondary)
+            }
+            if (task.failedPermanentCount > 0 && task.lastFailureReason.isNotBlank()) {
+                HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 2.dp))
+                Text(
+                    text = "Motivo principal: ${task.lastFailureReason}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = StatusWarning,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Button(
+            onClick = onAcknowledgeCompleted,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = AccentRed,
+                contentColor = TextPrimary,
+            ),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp),
+        ) {
+            Text(
+                text = "Concluído",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SummaryMetricRow(
+    label: String,
+    value: String,
+    valueColor: androidx.compose.ui.graphics.Color,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+            color = valueColor,
+        )
     }
 }
 
@@ -1145,7 +1327,8 @@ private fun ActiveClonePanel(
     onPauseResume: () -> Unit,
     onCancel: () -> Unit,
 ) {
-    val isRunning = task.status == CloneTaskStatus.RUNNING
+    val isActive = CloneTaskStatus.isActiveOrRunning(task.status)
+    val isScanning = task.status == CloneTaskStatus.SCANNING
     val progress = if (task.totalMessagesEstimate > 0) {
         (task.clonedCount.toFloat() / task.totalMessagesEstimate.toFloat()).coerceIn(0f, 1f)
     } else {
@@ -1174,7 +1357,7 @@ private fun ActiveClonePanel(
             )
             Spacer(modifier = Modifier.width(6.dp))
             Icon(
-                imageVector = Icons.Rounded.ArrowForward,
+                imageVector = Icons.AutoMirrored.Rounded.ArrowForward,
                 contentDescription = null,
                 tint = AccentRed,
                 modifier = Modifier.size(16.dp),
@@ -1190,9 +1373,24 @@ private fun ActiveClonePanel(
             )
         }
 
+        if (task.totalFound > 0) {
+            Spacer(modifier = Modifier.height(6.dp))
+            val breakdown = buildString {
+                append("${task.videoCount} vídeos • ${task.photoCount} fotos • ${task.otherCount} outros")
+                if (task.topicCount > 0) append(" • ${task.topicCount} tópicos")
+            }
+            Text(
+                text = breakdown,
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
         Spacer(modifier = Modifier.height(10.dp))
 
-        if (task.totalMessagesEstimate > 0) {
+        if (!isScanning && task.totalMessagesEstimate > 0) {
             LinearProgressIndicator(
                 progress = { progress },
                 color = AccentRed,
@@ -1220,10 +1418,10 @@ private fun ActiveClonePanel(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val counterLabel = if (task.totalMessagesEstimate > 0) {
-                "${task.clonedCount} / ${task.totalMessagesEstimate} mensagens"
-            } else {
-                "${task.clonedCount} mensagens"
+            val counterLabel = when {
+                isScanning -> "Pré-scan"
+                task.totalMessagesEstimate > 0 -> "${task.clonedCount} / ${task.totalMessagesEstimate} mensagens"
+                else -> "${task.clonedCount} mensagens"
             }
             Text(
                 text = counterLabel,
@@ -1256,14 +1454,14 @@ private fun ActiveClonePanel(
                     .height(40.dp),
             ) {
                 Icon(
-                    imageVector = if (isRunning) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    imageVector = if (isActive) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                     contentDescription = null,
                     tint = TextPrimary,
                     modifier = Modifier.size(18.dp),
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = if (isRunning) "Pausar" else "Retomar",
+                    text = if (isActive) "Pausar" else "Retomar",
                     style = MaterialTheme.typography.labelLarge,
                     color = TextPrimary,
                 )

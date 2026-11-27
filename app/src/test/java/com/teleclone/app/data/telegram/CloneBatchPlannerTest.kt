@@ -2,6 +2,7 @@ package com.teleclone.app.data.telegram
 
 import com.teleclone.app.data.model.CloneSettings
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.random.Random
@@ -15,13 +16,27 @@ class CloneBatchPlannerTest {
         type: CloneMessageType = CloneMessageType.TEXT,
         albumId: Long = 0L,
         canBeSaved: Boolean = true,
+        targetThreadId: Long = 0L,
     ) = CloneableMessage(
         id = id,
         mediaAlbumId = albumId,
         canBeSaved = canBeSaved,
         type = type,
         payload = id,
+        originThreadId = targetThreadId,
+        targetThreadId = targetThreadId,
     )
+
+    @Test
+    fun `video document detection recognizes video mimeType and mp4 mkv mov avi extensions`() {
+        assertTrue(CloneBatchPlanner.isVideoDocument("video/mp4", "clip.bin"))
+        assertTrue(CloneBatchPlanner.isVideoDocument("video/x-matroska", null))
+        assertTrue(CloneBatchPlanner.isVideoDocument("application/octet-stream", "Aula01.MKV"))
+        assertTrue(CloneBatchPlanner.isVideoDocument(null, "video.mov"))
+        assertTrue(CloneBatchPlanner.isVideoDocument(null, "sample.avi"))
+        assertTrue(CloneBatchPlanner.isVideoDocument(null, "movie.mp4"))
+        assertFalse(CloneBatchPlanner.isVideoDocument("application/pdf", "apostila.pdf"))
+    }
 
     @Test
     fun `block of 250 single messages is sliced internally into 100 100 50 TDLib calls`() {
@@ -43,6 +58,24 @@ class CloneBatchPlannerTest {
         assertEquals(1, blocks.size)
         assertEquals(500, blocks[0].messageCount)
         assertEquals(listOf(100, 100, 100, 100, 100), blocks[0].tdLibCalls.map { it.size })
+    }
+
+    @Test
+    fun `blocks and TDLib calls never mix messages from different targetThreadId topics`() {
+        val topic1Msgs = (1L..120L).map { msg(it, targetThreadId = 10L) }
+        val topic2Msgs = (121L..250L).map { msg(it, targetThreadId = 20L) }
+
+        val units = CloneBatchPlanner.buildSendUnits(topic1Msgs + topic2Msgs, allEnabledSettings)
+        val blocks = CloneBatchPlanner.buildBlocks(units, blockSize = 250, preserveAlbumIntegrity = true)
+
+        assertEquals(2, blocks.size)
+        assertEquals(10L, blocks[0].targetThreadId)
+        assertEquals(120, blocks[0].messageCount)
+        assertEquals(listOf(100, 20), blocks[0].tdLibCalls.map { it.size })
+
+        assertEquals(20L, blocks[1].targetThreadId)
+        assertEquals(130, blocks[1].messageCount)
+        assertEquals(listOf(100, 30), blocks[1].tdLibCalls.map { it.size })
     }
 
     @Test
@@ -113,5 +146,6 @@ class CloneBatchPlannerTest {
             assertTrue("Delay $delay out of [5000, 8000]", delay in 5_000L..8_000L)
         }
         assertEquals(5_000L, CloneBatchPlanner.computeJitterDelayMs(5_000L, 5_000L, rng))
+        assertEquals(0L, CloneBatchPlanner.computeJitterDelayMs(0L, 0L, rng))
     }
 }

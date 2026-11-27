@@ -44,13 +44,13 @@ object BatchModeValidator {
         val parsedMin = config.jitterMinText.trim().replace(',', '.').toDoubleOrNull()
         val parsedMax = config.jitterMaxText.trim().replace(',', '.').toDoubleOrNull()
 
-        val isMinValid = parsedMin != null && parsedMin.isFinite() && parsedMin > 0.0
-        val isMaxValid = parsedMax != null && parsedMax.isFinite() && parsedMax > 0.0 &&
+        val isMinValid = parsedMin != null && parsedMin.isFinite() && parsedMin >= 0.0
+        val isMaxValid = parsedMax != null && parsedMax.isFinite() && parsedMax >= 0.0 &&
             (parsedMin == null || parsedMax >= parsedMin)
 
         val jitterError = when {
-            !isMinValid -> "Mínimo deve ser maior que 0"
-            parsedMax == null || !parsedMax.isFinite() || parsedMax <= 0.0 -> "Máximo deve ser maior que 0"
+            !isMinValid -> "Mínimo deve ser >= 0"
+            parsedMax == null || !parsedMax.isFinite() || parsedMax < 0.0 -> "Máximo deve ser >= 0"
             parsedMin != null && parsedMax < parsedMin -> "Máximo deve ser >= Mínimo"
             else -> null
         }

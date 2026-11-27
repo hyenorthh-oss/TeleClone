@@ -1,5 +1,7 @@
 package com.teleclone.app.data.telegram
 
+import com.teleclone.app.data.model.CloneMessageEntity
+import com.teleclone.app.data.model.CloneMessageStatus
 import com.teleclone.app.data.model.CloneSettings
 import com.teleclone.app.data.model.CloneTaskEntity
 import com.teleclone.app.data.model.CloneTaskStatus
@@ -25,18 +27,91 @@ class CloneEngineIntegrationTest {
         type: CloneMessageType = CloneMessageType.TEXT,
         albumId: Long = 0L,
         canBeSaved: Boolean = true,
+        originThreadId: Long = 0L,
+        targetThreadId: Long = originThreadId,
+        canBeForwarded: Boolean = true,
     ) = CloneableMessage(
         id = id,
         mediaAlbumId = albumId,
         canBeSaved = canBeSaved,
         type = type,
         payload = id,
+        originThreadId = originThreadId,
+        targetThreadId = targetThreadId,
+        canBeForwarded = canBeForwarded,
     )
+
+    private class InMemoryTaskQueueStore(initialTask: CloneTaskEntity) : TaskQueueStore {
+        var task: CloneTaskEntity = initialTask
+        val messages = linkedMapOf<Long, CloneMessageEntity>()
+
+        override suspend fun saveScannedMessages(items: List<CloneMessageEntity>) {
+            items.forEach { messages.putIfAbsent(it.messageId, it) }
+        }
+
+        override suspend fun getPendingMessages(taskId: Long): List<CloneMessageEntity> =
+            messages.values.filter { it.taskId == taskId && it.status == CloneMessageStatus.PENDING }.sortedBy { it.messageId }
+
+        override suspend fun countByStatus(taskId: Long, status: String): Int =
+            messages.values.count { it.taskId == taskId && it.status == status }
+
+        override suspend fun markSent(taskId: Long, messageIds: List<Long>) {
+            messageIds.forEach { id ->
+                messages[id]?.let { messages[id] = it.copy(status = CloneMessageStatus.SENT, errorMessage = "") }
+            }
+        }
+
+        override suspend fun markFailedPermanent(taskId: Long, messageIds: List<Long>, reason: String) {
+            messageIds.forEach { id ->
+                messages[id]?.let {
+                    messages[id] = it.copy(
+                        status = CloneMessageStatus.FAILED_PERMANENT,
+                        attemptCount = it.attemptCount + 1,
+                        errorMessage = reason,
+                    )
+                }
+            }
+        }
+
+        override suspend fun incrementAttempt(taskId: Long, messageIds: List<Long>, reason: String) {
+            messageIds.forEach { id ->
+                messages[id]?.let {
+                    messages[id] = it.copy(
+                        attemptCount = it.attemptCount + 1,
+                        errorMessage = reason,
+                    )
+                }
+            }
+        }
+
+        override suspend fun updateTask(task: CloneTaskEntity) {
+            this.task = task
+        }
+
+        override suspend fun updateDetailedProgress(
+            taskId: Long,
+            lastClonedMessageId: Long,
+            clonedCount: Int,
+            failedCount: Int,
+            lastFailureReason: String,
+            updatedAt: Long,
+        ) {
+            task = task.copy(
+                lastClonedMessageId = lastClonedMessageId,
+                clonedCount = clonedCount,
+                failedPermanentCount = failedCount,
+                lastFailureReason = lastFailureReason,
+                updatedAt = updatedAt,
+            )
+        }
+
+        override suspend fun updateStatus(taskId: Long, status: String, updatedAt: Long) {
+            task = task.copy(status = status, updatedAt = updatedAt)
+        }
+    }
 
     @Test
     fun `paginated history fetch continues across page boundary to keep album intact`() = runTest {
-        // Page 1 (limit 4) ends mid-album (ids 3, 4 with albumId=888)
-        // Page 2 finishes album (ids 5, 6 with albumId=888) + next msg 7
         val allMessages = listOf(
             item(1L, CloneMessageType.TEXT),
             item(2L, CloneMessageType.TEXT),
@@ -80,7 +155,6 @@ class CloneEngineIntegrationTest {
         ) {
             attempts++
             if (attempts <= 3) {
-                // Simulate infinite hang on TDLib callback
                 suspendCancellableCoroutine<Int> { /* never resumes */ }
             } else {
                 42
@@ -111,20 +185,6 @@ class CloneEngineIntegrationTest {
     }
 
     @Test
-    fun `400 CHAT_FORWARDS_RESTRICTED logs and skips without stalling queue`() = runTest {
-        val warnings = mutableListOf<String>()
-        val outcome = CloneReliabilityExecutor.executeWithPolicy<Int>(
-            onRestrictedSkip = { err -> warnings.add(err.message) },
-            delayFn = { ms -> delay(ms) },
-        ) {
-            throw TdLibException(400, "CHAT_FORWARDS_RESTRICTED")
-        }
-
-        assertTrue(outcome is ReliabilityOutcome.RestrictedSkipped)
-        assertEquals(1, warnings.size)
-    }
-
-    @Test
     fun `429 FloodWait auto-recovers after X plus 1 seconds and emits countdown`() = runTest {
         var attempts = 0
         val ticks = mutableListOf<Int>()
@@ -146,40 +206,132 @@ class CloneEngineIntegrationTest {
     }
 
     @Test
-    fun `batch runner commits progress immediately, preserves DB count across pause-resume, with zero duplicates or skips`() = runTest {
-        // 350 messages total including a 12-item album, a mixed album, and 2 system messages
-        val sourceMessages = mutableListOf<CloneableMessage<Long>>()
-        var id = 1L
-        // 1..195 text
-        repeat(195) { sourceMessages.add(item(id++, CloneMessageType.TEXT)) }
-        // 196..207 = 12-photo album (crosses 200 mark, tests >10 rule)
-        repeat(12) { sourceMessages.add(item(id++, CloneMessageType.PHOTO, albumId = 5001L)) }
-        // 208 = system message (not forwardable)
-        sourceMessages.add(item(id++, CloneMessageType.UNSUPPORTED, canBeSaved = false))
-        // 209..211 = mixed album (photo + doc + audio)
-        sourceMessages.add(item(id++, CloneMessageType.PHOTO, albumId = 5002L))
-        sourceMessages.add(item(id++, CloneMessageType.DOCUMENT, albumId = 5002L))
-        sourceMessages.add(item(id++, CloneMessageType.AUDIO, albumId = 5002L))
-        // remaining text up to 350 total IDs
-        while (id <= 350L) {
-            sourceMessages.add(item(id++, CloneMessageType.TEXT))
-        }
-        val expectedForwardableIds = sourceMessages.filter { it.canBeSaved && it.type != CloneMessageType.UNSUPPORTED }.map { it.id }
+    fun `confirmation barrier handles partial failure 97 ok plus 3 failed by resending only missing 3 items before advancing`() = runTest {
+        val sourceMessages = (1L..110L).map { item(it) }
+        val sentHistory = mutableListOf<List<Long>>()
+        var firstBatchDispatched = false
 
-        val sentIds = mutableListOf<Long>()
-        val dbTasks = mutableMapOf<Long, CloneTaskEntity>()
-        val observedStatusMessages = mutableListOf<String>()
-
-        var task = CloneTaskEntity(
-            id = 99L,
-            sourceChatId = 1001L,
+        val task = CloneTaskEntity(
+            id = 50L,
+            sourceChatId = 100L,
             sourceTitle = "Origem",
-            targetChatId = 2002L,
+            targetChatId = 200L,
             targetTitle = "Destino",
             lastClonedMessageId = 0L,
-            totalMessagesEstimate = expectedForwardableIds.size,
+            totalMessagesEstimate = 0,
             clonedCount = 0,
-            status = CloneTaskStatus.RUNNING,
+            status = CloneTaskStatus.SCANNING,
+            updatedAt = 0L,
+            isBatchMode = true,
+            batchBlockSize = 100,
+            batchJitterMinMs = 2_000L,
+            batchJitterMaxMs = 2_000L,
+            preserveAlbumIntegrity = true,
+        )
+        val store = InMemoryTaskQueueStore(task)
+
+        val gateway = object : CloneExecutionGateway<Long> {
+            override suspend fun isForumSupergroup(chatId: Long): Boolean = false
+            override suspend fun listForumTopics(chatId: Long): List<ForumTopicDescriptor> = emptyList()
+            override suspend fun createForumTopic(chatId: Long, topic: ForumTopicDescriptor): ForumTopicDescriptor = topic
+            override suspend fun fetchHistoryPage(chatId: Long, fromMessageId: Long, limit: Int): List<CloneableMessage<Long>> =
+                if (fromMessageId == 0L) sourceMessages else emptyList()
+
+            override suspend fun searchChatMessages(chatId: Long, filter: SearchFilterKind, fromMessageId: Long, limit: Int) =
+                SearchPageResult(emptyList<CloneableMessage<Long>>(), 0L)
+
+            override suspend fun isChatProtected(chatId: Long): Boolean = false
+            override suspend fun getMessage(chatId: Long, messageId: Long): CloneableMessage<Long>? =
+                sourceMessages.firstOrNull { it.id == messageId }
+
+            override suspend fun canForwardMessage(chatId: Long, message: CloneableMessage<Long>): Boolean = true
+
+            override suspend fun forwardMessages(
+                sourceChatId: Long,
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                messages: List<CloneableMessage<Long>>,
+            ): List<DispatchedItemHandle> {
+                sentHistory.add(messages.map { it.id })
+                if (!firstBatchDispatched && messages.size == 100) {
+                    firstBatchDispatched = true
+                    return messages.mapIndexed { idx, msg ->
+                        if (idx >= 97) {
+                            // 3 items stay pending/transiently fail in target
+                            DispatchedItemHandle(msg.id, 10_000L + msg.id, DispatchedSendingState.Pending)
+                        } else {
+                            DispatchedItemHandle(msg.id, 10_000L + msg.id, DispatchedSendingState.Confirmed)
+                        }
+                    }
+                }
+                return messages.map { DispatchedItemHandle(it.id, 20_000L + it.id, DispatchedSendingState.Confirmed) }
+            }
+
+            override suspend fun applyPostCopyTextCleanup(targetChatId: Long, handles: List<DispatchedItemHandle>, settings: CloneSettings) = Unit
+
+            override suspend fun checkDispatchedMessageState(targetChatId: Long, targetMessageId: Long): DispatchedSendingState {
+                // Simulate those 3 items failing with 429 retry after 2s during drain
+                return DispatchedSendingState.Failed(429, "FLOOD_WAIT_2", retryAfterSeconds = 2)
+            }
+
+            override suspend fun reuploadProtectedItems(
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                items: List<CloneableMessage<Long>>,
+                settings: CloneSettings,
+            ): List<DispatchedItemHandle> = emptyList()
+        }
+
+        val runner = CloneSessionRunner(
+            gateway = gateway,
+            store = store,
+            settingsProvider = { CloneSettings() },
+            plannerContext = EmptyCoroutineContext,
+            delayFn = { ms -> delay(ms) },
+        )
+
+        val completed = runner.run(task)
+        assertEquals(CloneTaskStatus.COMPLETED, completed.status)
+        assertEquals(110, completed.clonedCount)
+        assertEquals(0, completed.failedPermanentCount)
+        // Call 1: 1..100 (97 ok + 3 failed), Call 2: ONLY 98..100 BEFORE advancing, Call 3: 101..110!
+        assertEquals(3, sentHistory.size)
+        assertEquals((1L..100L).toList(), sentHistory[0])
+        assertEquals(listOf(98L, 99L, 100L), sentHistory[1])
+        assertEquals((101L..110L).toList(), sentHistory[2])
+    }
+
+    @Test
+    fun `4-phase runner executes recovery pass, protected content fallback, pause-resume, and stays COMPLETED`() = runTest {
+        // 300 messages across 2 forum topics + a 12-item album + a protected message + a silent missing item requiring Phase C recovery
+        val sourceMessages = mutableListOf<CloneableMessage<Long>>()
+        var id = 1L
+        repeat(195) { sourceMessages.add(item(id++, CloneMessageType.TEXT, originThreadId = 10L)) }
+        repeat(12) { sourceMessages.add(item(id++, CloneMessageType.PHOTO, albumId = 5001L, originThreadId = 10L)) }
+        sourceMessages.add(item(id++, CloneMessageType.UNSUPPORTED, canBeSaved = false, originThreadId = 10L))
+        // Protected item #209 (canBeForwarded = false) -> must route to ProtectedContentReuploader
+        sourceMessages.add(item(id++, CloneMessageType.VIDEO, originThreadId = 20L, canBeForwarded = false))
+        while (id <= 300L) {
+            sourceMessages.add(item(id++, CloneMessageType.TEXT, originThreadId = 20L))
+        }
+
+        val expectedIds = sourceMessages.filter { it.type != CloneMessageType.UNSUPPORTED }.map { it.id }
+        val sentIds = mutableListOf<Long>()
+        val reuploadedIds = mutableListOf<Long>()
+        val statusPhases = mutableListOf<String>()
+
+        val initialTask = CloneTaskEntity(
+            id = 777L,
+            sourceChatId = 1001L,
+            sourceTitle = "Fórum Origem",
+            targetChatId = 2002L,
+            targetTitle = "Fórum Destino",
+            lastClonedMessageId = 0L,
+            totalMessagesEstimate = 0,
+            clonedCount = 0,
+            status = CloneTaskStatus.SCANNING,
             updatedAt = 0L,
             isBatchMode = true,
             batchBlockSize = 150,
@@ -187,120 +339,139 @@ class CloneEngineIntegrationTest {
             batchJitterMaxMs = 8_000L,
             preserveAlbumIntegrity = true,
         )
-        dbTasks[task.id] = task
-
-        val store = object : TaskProgressStore {
-            override suspend fun updateProgress(taskId: Long, lastClonedMessageId: Long, clonedCount: Int, updatedAt: Long) {
-                val cur = dbTasks[taskId]!!
-                dbTasks[taskId] = cur.copy(
-                    lastClonedMessageId = lastClonedMessageId,
-                    clonedCount = clonedCount,
-                    updatedAt = updatedAt,
-                )
-            }
-
-            override suspend fun updateStatus(taskId: Long, status: String, updatedAt: Long) {
-                val cur = dbTasks[taskId]!!
-                dbTasks[taskId] = cur.copy(status = status, updatedAt = updatedAt)
-            }
-        }
-
-        val transport = object : CloneTransport<Long> {
-            override suspend fun fetchHistoryBatch(
-                chatId: Long,
-                fromMessageId: Long,
-                desiredForwardableCount: Int,
-            ): PaginatedHistoryResult<Long> {
-                return HistoryPagePaginator.fetchBatch(
-                    fromMessageId = fromMessageId,
-                    desiredForwardableCount = desiredForwardableCount,
-                    pageLimit = 50,
-                    isChatProtected = { false },
-                    fetchPage = { cursorId, limit ->
-                        val start = if (cursorId <= 1L && fromMessageId == 0L) 0 else sourceMessages.indexOfFirst { it.id > cursorId }.let {
-                            if (it == -1) sourceMessages.size else it
-                        }
-                        sourceMessages.drop(start).take(limit)
-                    },
-                    fetchOldestFallback = { emptyList() },
-                )
-            }
-
-            override suspend fun forwardCopyClean(
-                sourceChatId: Long,
-                targetChatId: Long,
-                messages: List<CloneableMessage<Long>>,
-                settings: CloneSettings,
-                onStatusUpdate: suspend (String) -> Unit,
-            ): Int {
-                messages.forEach { sentIds.add(it.id) }
-                return messages.size
-            }
-        }
-
+        val store = InMemoryTaskQueueStore(initialTask)
         var callsCount = 0
         var pausedJob: kotlinx.coroutines.Job? = null
+        var fail250Remaining = 4 // exhausts Phase B (1 + 3 retries) so Phase C Repescagem recovers #250
 
-        // Trigger pause cleanly when call #4 begins (Block 1 = 100+50, Block 2 starts with 45 -> 195 persisted!)
-        val pausingTransport = object : CloneTransport<Long> by transport {
-            override suspend fun forwardCopyClean(
+        fun makeGateway(pauseAtCall: Int?): CloneExecutionGateway<Long> = object : CloneExecutionGateway<Long> {
+            override suspend fun isForumSupergroup(chatId: Long): Boolean = true
+            override suspend fun listForumTopics(chatId: Long): List<ForumTopicDescriptor> =
+                if (chatId == 1001L) {
+                    listOf(ForumTopicDescriptor(10L, "Tópico A"), ForumTopicDescriptor(20L, "Tópico B"))
+                } else {
+                    emptyList()
+                }
+
+            override suspend fun createForumTopic(chatId: Long, topic: ForumTopicDescriptor): ForumTopicDescriptor =
+                topic.copy(threadId = topic.threadId * 10L) // 10->100, 20->200
+
+            override suspend fun fetchHistoryPage(chatId: Long, fromMessageId: Long, limit: Int): List<CloneableMessage<Long>> =
+                if (fromMessageId == 0L) sourceMessages else emptyList()
+
+            override suspend fun searchChatMessages(chatId: Long, filter: SearchFilterKind, fromMessageId: Long, limit: Int) =
+                SearchPageResult(emptyList<CloneableMessage<Long>>(), 0L)
+
+            override suspend fun isChatProtected(chatId: Long): Boolean = false
+            override suspend fun getMessage(chatId: Long, messageId: Long): CloneableMessage<Long>? =
+                sourceMessages.firstOrNull { it.id == messageId }
+
+            override suspend fun canForwardMessage(chatId: Long, message: CloneableMessage<Long>): Boolean =
+                message.canBeForwarded
+
+            override suspend fun forwardMessages(
                 sourceChatId: Long,
                 targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
                 messages: List<CloneableMessage<Long>>,
-                settings: CloneSettings,
-                onStatusUpdate: suspend (String) -> Unit,
-            ): Int {
+            ): List<DispatchedItemHandle> {
                 callsCount++
-                if (callsCount == 4) {
+                if (pauseAtCall != null && callsCount == pauseAtCall) {
                     pausedJob?.cancel(CancellationException("User paused"))
                     suspendCancellableCoroutine<Unit> { }
                 }
-                return transport.forwardCopyClean(sourceChatId, targetChatId, messages, settings, onStatusUpdate)
+                // Assert topic routing never mixes topics
+                assertTrue(targetIsForum)
+                assertTrue(targetThreadId == 100L || targetThreadId == 200L)
+                assertTrue(messages.all { it.targetThreadId == targetThreadId })
+
+                // Fail item 250 in Phase B (initial + 3 retries) so Phase C (Repescagem) recovers it!
+                if (fail250Remaining > 0 && messages.any { it.id == 250L }) {
+                    fail250Remaining--
+                    return messages.map { msg ->
+                        if (msg.id == 250L) {
+                            DispatchedItemHandle(msg.id, 0L, DispatchedSendingState.Failed(500, "Silent temporary error"))
+                        } else {
+                            sentIds.add(msg.id)
+                            DispatchedItemHandle(msg.id, 30_000L + msg.id, DispatchedSendingState.Confirmed)
+                        }
+                    }
+                }
+
+                messages.forEach { sentIds.add(it.id) }
+                return messages.map { DispatchedItemHandle(it.id, 30_000L + it.id, DispatchedSendingState.Confirmed) }
+            }
+
+            override suspend fun applyPostCopyTextCleanup(targetChatId: Long, handles: List<DispatchedItemHandle>, settings: CloneSettings) = Unit
+            override suspend fun checkDispatchedMessageState(targetChatId: Long, targetMessageId: Long) = DispatchedSendingState.Confirmed
+
+            override suspend fun reuploadProtectedItems(
+                targetChatId: Long,
+                targetThreadId: Long,
+                targetIsForum: Boolean,
+                items: List<CloneableMessage<Long>>,
+                settings: CloneSettings,
+            ): List<DispatchedItemHandle> {
+                assertEquals(200L, targetThreadId)
+                items.forEach {
+                    reuploadedIds.add(it.id)
+                    sentIds.add(it.id)
+                }
+                return items.map { DispatchedItemHandle(it.id, 40_000L + it.id, DispatchedSendingState.Confirmed) }
             }
         }
 
         val runner1 = CloneSessionRunner(
-            transport = pausingTransport,
+            gateway = makeGateway(pauseAtCall = 3),
             store = store,
             settingsProvider = { CloneSettings() },
             plannerContext = EmptyCoroutineContext,
-            random = Random(7),
+            backoffMs = listOf(100L, 100L, 100L),
+            random = Random(1),
             delayFn = { ms -> delay(ms) },
+            onProgress = { t, txt, _, _, _ -> statusPhases.add("${t.status}:$txt") },
         )
 
         pausedJob = launch {
             try {
-                runner1.run(task)
+                runner1.run(initialTask)
             } catch (_: CancellationException) {
-                store.updateStatus(task.id, CloneTaskStatus.PAUSED, 100L)
+                store.updateStatus(initialTask.id, CloneTaskStatus.PAUSED, 100L)
             }
         }
         advanceUntilIdle()
 
-        val savedPaused = dbTasks[task.id]!!
-        assertEquals(CloneTaskStatus.PAUSED, savedPaused.status)
-        assertEquals(195, savedPaused.clonedCount)
-        assertEquals(savedPaused.clonedCount, sentIds.size)
+        assertEquals(CloneTaskStatus.PAUSED, store.task.status)
+        assertEquals(150, store.task.clonedCount) // Block 1 (150 msgs) persisted before pause at Block 2
+        assertEquals(2, store.task.topicCount)
 
-        // Resume from saved DB state
+        // Resume from saved DB state (no re-scan, finishes Phase B + Phase C recovery + Phase D persistent COMPLETED)
         val runner2 = CloneSessionRunner(
-            transport = transport,
+            gateway = makeGateway(pauseAtCall = null),
             store = store,
             settingsProvider = { CloneSettings() },
             plannerContext = EmptyCoroutineContext,
-            random = Random(7),
+            backoffMs = listOf(100L, 100L, 100L),
+            random = Random(1),
             delayFn = { ms -> delay(ms) },
-            onProgress = { _, statusText, _, _, _ -> observedStatusMessages.add(statusText) },
+            onProgress = { t, txt, _, _, _ -> statusPhases.add("${t.status}:$txt") },
         )
 
-        val finalTask = runner2.run(savedPaused.copy(status = CloneTaskStatus.RUNNING))
+        val finalTask = runner2.run(store.task.copy(status = CloneTaskStatus.RUNNING))
         advanceUntilIdle()
 
         assertEquals(CloneTaskStatus.COMPLETED, finalTask.status)
-        assertEquals(expectedForwardableIds.size, finalTask.clonedCount)
-        assertEquals(expectedForwardableIds, sentIds)
-        assertEquals(expectedForwardableIds.size, sentIds.distinct().size)
-        assertTrue(observedStatusMessages.any { it.contains("Pausa jitter:") })
+        assertEquals(CloneTaskStatus.COMPLETED, store.task.status) // Remains persisted until "Concluído"
+        assertEquals(expectedIds.size, finalTask.clonedCount)
+        assertEquals(0, finalTask.failedPermanentCount)
+        assertEquals(listOf(209L), reuploadedIds)
+        assertEquals(expectedIds.sorted(), sentIds.sorted())
+        assertEquals(expectedIds.size, sentIds.distinct().size)
+        assertTrue(statusPhases.any { it.startsWith("${CloneTaskStatus.SCANNING}:") })
+        assertTrue(statusPhases.any { it.startsWith("${CloneTaskStatus.VERIFYING}:") })
+        assertTrue(statusPhases.any { it.contains("Pausa jitter:") })
+        assertTrue(statusPhases.last().startsWith("${CloneTaskStatus.COMPLETED}:"))
     }
 
     @Test

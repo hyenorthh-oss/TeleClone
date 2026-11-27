@@ -15,15 +15,12 @@ import androidx.core.app.NotificationCompat
 import com.teleclone.app.MainActivity
 import com.teleclone.app.data.local.AppDatabase
 import com.teleclone.app.data.local.SettingsDataStore
+import com.teleclone.app.data.model.CloneMessageEntity
 import com.teleclone.app.data.model.CloneProgressState
-import com.teleclone.app.data.model.CloneSettings
 import com.teleclone.app.data.model.CloneTaskEntity
 import com.teleclone.app.data.model.CloneTaskStatus
 import com.teleclone.app.data.telegram.CloneSessionRunner
-import com.teleclone.app.data.telegram.CloneTransport
-import com.teleclone.app.data.telegram.CloneableMessage
-import com.teleclone.app.data.telegram.PaginatedHistoryResult
-import com.teleclone.app.data.telegram.TaskProgressStore
+import com.teleclone.app.data.telegram.TaskQueueStore
 import com.teleclone.app.data.telegram.TdLibManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -32,13 +29,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.drinkless.tdlib.TdApi
 
 class CloneForegroundService : Service() {
 
@@ -75,7 +70,7 @@ class CloneForegroundService : Service() {
                 val existingTaskId = intent.getLongExtra(EXTRA_TASK_ID, 0L)
                 val isBatchMode = intent.getBooleanExtra(EXTRA_IS_BATCH_MODE, false)
                 val blockSize = intent.getIntExtra(EXTRA_BATCH_BLOCK_SIZE, 1).coerceAtLeast(1)
-                val jitterMinMs = intent.getLongExtra(EXTRA_BATCH_JITTER_MIN_MS, 2500L).coerceAtLeast(1L)
+                val jitterMinMs = intent.getLongExtra(EXTRA_BATCH_JITTER_MIN_MS, 2500L).coerceAtLeast(0L)
                 val jitterMaxMs = intent.getLongExtra(EXTRA_BATCH_JITTER_MAX_MS, jitterMinMs).coerceAtLeast(jitterMinMs)
                 val preserveAlbumIntegrity = intent.getBooleanExtra(EXTRA_PRESERVE_ALBUM_INTEGRITY, true)
 
@@ -86,8 +81,9 @@ class CloneForegroundService : Service() {
                         targetTitle = targetTitle,
                         cloned = 0,
                         total = 0,
-                        statusText = if (isBatchMode) "Iniciando Modo Lote ($blockSize msgs)..." else "Iniciando clonagem...",
+                        statusText = "Contabilizando arquivos e tópicos do canal de origem...",
                         isPaused = false,
+                        isCompleted = false,
                     )
                 )
                 startOrResumeCloning(
@@ -118,12 +114,16 @@ class CloneForegroundService : Service() {
                         total = current?.totalMessagesEstimate ?: 0,
                         statusText = "Retomando clonagem...",
                         isPaused = false,
+                        isCompleted = false,
                     )
                 )
                 resumeTaskById(taskId)
             }
             ACTION_CANCEL -> {
                 cancelActiveCloning()
+            }
+            ACTION_DISMISS_COMPLETED -> {
+                dismissCompletedTask()
             }
         }
         return START_NOT_STICKY
@@ -189,7 +189,6 @@ class CloneForegroundService : Service() {
         jitterMaxMs: Long,
         preserveAlbumIntegrity: Boolean,
     ): CloneTaskEntity {
-        val estimate = TdLibManager.getChatMessageCountEstimate(sourceChatId)
         val task = CloneTaskEntity(
             id = System.currentTimeMillis(),
             sourceChatId = sourceChatId,
@@ -197,9 +196,9 @@ class CloneForegroundService : Service() {
             targetChatId = targetChatId,
             targetTitle = targetTitle,
             lastClonedMessageId = 0L,
-            totalMessagesEstimate = estimate,
+            totalMessagesEstimate = 0,
             clonedCount = 0,
-            status = CloneTaskStatus.RUNNING,
+            status = CloneTaskStatus.SCANNING,
             updatedAt = System.currentTimeMillis(),
             isBatchMode = isBatchMode,
             batchBlockSize = blockSize,
@@ -268,6 +267,7 @@ class CloneForegroundService : Service() {
             withContext(NonCancellable) {
                 val current = activeLoopTask ?: _progressState.value.activeTask
                 if (current != null) {
+                    database.cloneMessageDao().deleteForTask(current.id)
                     database.cloneTaskDao().deleteById(current.id)
                 }
                 activeLoopTask = null
@@ -278,75 +278,94 @@ class CloneForegroundService : Service() {
         }
     }
 
+    private fun dismissCompletedTask() {
+        serviceScope.launch {
+            withContext(NonCancellable) {
+                val current = activeLoopTask ?: _progressState.value.activeTask
+                if (current != null) {
+                    database.cloneMessageDao().deleteForTask(current.id)
+                    database.cloneTaskDao().updateStatus(
+                        current.id,
+                        CloneTaskStatus.ARCHIVED,
+                        System.currentTimeMillis(),
+                    )
+                }
+                activeLoopTask = null
+                _progressState.value = CloneProgressState()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
     private suspend fun runCloningLoop(initialTask: CloneTaskEntity) {
-        val dao = database.cloneTaskDao()
+        val taskDao = database.cloneTaskDao()
+        val msgDao = database.cloneMessageDao()
         var currentTask = initialTask
         activeLoopTask = currentTask
 
-        if (currentTask.totalMessagesEstimate <= 0) {
-            val estimate = TdLibManager.getChatMessageCountEstimate(currentTask.sourceChatId)
-            if (estimate > 0) {
-                currentTask = currentTask.copy(totalMessagesEstimate = estimate)
-                activeLoopTask = currentTask
-                dao.updateTotalEstimate(currentTask.id, estimate, System.currentTimeMillis())
-            }
-        }
-
-        val transport = object : CloneTransport<TdApi.Message> {
-            override suspend fun fetchHistoryBatch(
-                chatId: Long,
-                fromMessageId: Long,
-                desiredForwardableCount: Int,
-            ): PaginatedHistoryResult<TdApi.Message> {
-                val res = TdLibManager.fetchHistoryBatch(
-                    chatId = chatId,
-                    fromMessageId = fromMessageId,
-                    desiredForwardableCount = desiredForwardableCount,
-                )
-                return PaginatedHistoryResult(
-                    messages = res.messages.map { TdLibManager.toCloneableMessage(it) },
-                    maxScannedMessageId = res.maxScannedMessageId,
-                    isProtectedChat = res.isProtectedChat,
-                )
+        val store = object : TaskQueueStore {
+            override suspend fun saveScannedMessages(items: List<CloneMessageEntity>) {
+                items.chunked(500).forEach { chunk ->
+                    msgDao.insertAllIgnore(chunk)
+                }
             }
 
-            override suspend fun forwardCopyClean(
-                sourceChatId: Long,
-                targetChatId: Long,
-                messages: List<CloneableMessage<TdApi.Message>>,
-                settings: CloneSettings,
-                onStatusUpdate: suspend (String) -> Unit,
-            ): Int {
-                return TdLibManager.forwardCopyClean(
-                    sourceChatId = sourceChatId,
-                    targetChatId = targetChatId,
-                    messages = messages.map { it.payload },
-                    settings = settings,
-                    onStatusUpdate = { detail ->
-                        val latest = activeLoopTask ?: currentTask
-                        updateProgressState(latest, detail, null, isPaused = false)
-                    },
-                )
+            override suspend fun getPendingMessages(taskId: Long): List<CloneMessageEntity> {
+                return msgDao.getPendingMessages(taskId)
             }
-        }
 
-        val store = object : TaskProgressStore {
-            override suspend fun updateProgress(
+            override suspend fun countByStatus(taskId: Long, status: String): Int {
+                return msgDao.countByStatus(taskId, status)
+            }
+
+            override suspend fun markSent(taskId: Long, messageIds: List<Long>) {
+                messageIds.chunked(500).forEach { chunk ->
+                    msgDao.markSentChunk(taskId, chunk)
+                }
+            }
+
+            override suspend fun markFailedPermanent(taskId: Long, messageIds: List<Long>, reason: String) {
+                messageIds.chunked(500).forEach { chunk ->
+                    msgDao.markFailedPermanentChunk(taskId, chunk, reason)
+                }
+            }
+
+            override suspend fun incrementAttempt(taskId: Long, messageIds: List<Long>, reason: String) {
+                messageIds.chunked(500).forEach { chunk ->
+                    msgDao.incrementAttemptChunk(taskId, chunk, reason)
+                }
+            }
+
+            override suspend fun updateTask(task: CloneTaskEntity) {
+                taskDao.update(task)
+            }
+
+            override suspend fun updateDetailedProgress(
                 taskId: Long,
                 lastClonedMessageId: Long,
                 clonedCount: Int,
+                failedCount: Int,
+                lastFailureReason: String,
                 updatedAt: Long,
             ) {
-                dao.updateProgress(taskId, lastClonedMessageId, clonedCount, updatedAt)
+                taskDao.updateDetailedProgress(
+                    taskId = taskId,
+                    lastClonedMessageId = lastClonedMessageId,
+                    clonedCount = clonedCount,
+                    failedCount = failedCount,
+                    lastFailureReason = lastFailureReason,
+                    updatedAt = updatedAt,
+                )
             }
 
             override suspend fun updateStatus(taskId: Long, status: String, updatedAt: Long) {
-                dao.updateStatus(taskId, status, updatedAt)
+                taskDao.updateStatus(taskId, status, updatedAt)
             }
         }
 
         val runner = CloneSessionRunner(
-            transport = transport,
+            gateway = TdLibManager.createExecutionGateway(),
             store = store,
             settingsProvider = { settingsDataStore.getCloneSettings() },
             onTaskUpdated = { updated ->
@@ -366,11 +385,10 @@ class CloneForegroundService : Service() {
         )
 
         try {
-            runner.run(currentTask)
-            delay(2000L)
-            activeLoopTask = null
-            _progressState.value = CloneProgressState()
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            val completedTask = runner.run(currentTask)
+            // Keep completed summary card persisted in Room & _progressState until user taps "Concluído"
+            activeLoopTask = completedTask
+            stopForeground(STOP_FOREGROUND_DETACH)
             stopSelf()
         } catch (e: CancellationException) {
             throw e
@@ -378,11 +396,12 @@ class CloneForegroundService : Service() {
             Log.e(TAG, "Cloning loop error", e)
             val errorTask = (activeLoopTask ?: currentTask).copy(
                 status = CloneTaskStatus.ERROR,
+                lastFailureReason = e.message ?: "falha na clonagem",
                 updatedAt = System.currentTimeMillis(),
             )
             activeLoopTask = errorTask
             withContext(NonCancellable) {
-                dao.updateStatus(errorTask.id, CloneTaskStatus.ERROR, errorTask.updatedAt)
+                taskDao.update(errorTask)
                 updateProgressState(
                     task = errorTask,
                     statusText = "Erro: ${e.message ?: "falha na clonagem"}",
@@ -426,6 +445,7 @@ class CloneForegroundService : Service() {
                 total = task.totalMessagesEstimate,
                 statusText = statusText,
                 isPaused = isPaused,
+                isCompleted = task.status == CloneTaskStatus.COMPLETED,
             )
         )
     }
@@ -450,6 +470,7 @@ class CloneForegroundService : Service() {
         total: Int,
         statusText: String,
         isPaused: Boolean,
+        isCompleted: Boolean,
     ): Notification {
         val openAppIntent = PendingIntent.getActivity(
             this,
@@ -458,18 +479,10 @@ class CloneForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        val toggleActionIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, CloneForegroundService::class.java).apply {
-                action = if (isPaused) ACTION_RESUME else ACTION_PAUSE
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
         val progressLabel = if (total > 0) "$cloned / $total" else "$cloned mensagens"
         val title = if (sourceTitle.isNotBlank() && targetTitle.isNotBlank()) {
-            "Clonando: $sourceTitle \u2192 $targetTitle"
+            if (isCompleted) "Clonagem Concluída: $sourceTitle \u2192 $targetTitle"
+            else "Clonando: $sourceTitle \u2192 $targetTitle"
         } else {
             "TeleClone"
         }
@@ -480,15 +493,28 @@ class CloneForegroundService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(openAppIntent)
             .setOnlyAlertOnce(true)
-            .setOngoing(!isPaused)
+            .setOngoing(!isPaused && !isCompleted)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(
+
+        if (!isCompleted) {
+            val toggleActionIntent = PendingIntent.getService(
+                this,
+                1,
+                Intent(this, CloneForegroundService::class.java).apply {
+                    action = if (isPaused) ACTION_RESUME else ACTION_PAUSE
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
                 if (isPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
                 if (isPaused) "Retomar" else "Pausar",
                 toggleActionIntent,
             )
+        }
 
-        if (total > 0) {
+        if (isCompleted) {
+            builder.setProgress(100, 100, false)
+        } else if (total > 0) {
             builder.setProgress(total, cloned.coerceAtMost(total), false)
         } else {
             builder.setProgress(0, 0, true)
@@ -515,6 +541,7 @@ class CloneForegroundService : Service() {
         const val ACTION_PAUSE = "com.teleclone.app.action.PAUSE_CLONE"
         const val ACTION_RESUME = "com.teleclone.app.action.RESUME_CLONE"
         const val ACTION_CANCEL = "com.teleclone.app.action.CANCEL_CLONE"
+        const val ACTION_DISMISS_COMPLETED = "com.teleclone.app.action.DISMISS_COMPLETED_CLONE"
 
         const val EXTRA_SOURCE_CHAT_ID = "extra_source_chat_id"
         const val EXTRA_SOURCE_TITLE = "extra_source_title"
@@ -583,6 +610,14 @@ class CloneForegroundService : Service() {
         fun cancelCloning(context: Context) {
             val intent = Intent(context, CloneForegroundService::class.java).apply {
                 action = ACTION_CANCEL
+            }
+            runCatching { context.startService(intent) }
+        }
+
+        fun dismissCompleted(context: Context) {
+            _progressState.value = CloneProgressState()
+            val intent = Intent(context, CloneForegroundService::class.java).apply {
+                action = ACTION_DISMISS_COMPLETED
             }
             runCatching { context.startService(intent) }
         }

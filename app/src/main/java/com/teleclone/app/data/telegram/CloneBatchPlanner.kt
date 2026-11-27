@@ -26,6 +26,9 @@ data class CloneableMessage<T>(
     val canBeSaved: Boolean,
     val type: CloneMessageType,
     val payload: T,
+    val originThreadId: Long = 0L,
+    val targetThreadId: Long = 0L,
+    val canBeForwarded: Boolean = true,
 )
 
 data class SendUnit<T>(
@@ -34,6 +37,7 @@ data class SendUnit<T>(
 ) {
     val size: Int get() = items.size
     val lastMessageId: Long get() = items.last().id
+    val targetThreadId: Long get() = items.first().targetThreadId
 }
 
 data class TdLibCallBatch<T>(
@@ -41,6 +45,7 @@ data class TdLibCallBatch<T>(
 ) {
     val size: Int get() = items.size
     val lastMessageId: Long get() = items.last().id
+    val targetThreadId: Long get() = items.first().targetThreadId
 }
 
 data class CloneBlock<T>(
@@ -49,12 +54,22 @@ data class CloneBlock<T>(
 ) {
     val messageCount: Int get() = units.sumOf { it.size }
     val lastMessageId: Long get() = units.last().lastMessageId
+    val targetThreadId: Long get() = units.first().targetThreadId
 }
 
 object CloneBatchPlanner {
 
     const val MAX_ALBUM_ITEMS = 10
     const val MAX_TDLIB_FORWARD_IDS = 100
+
+    private val VIDEO_EXTENSIONS = setOf(".mp4", ".mkv", ".mov", ".avi")
+
+    fun isVideoDocument(mimeType: String?, fileName: String?): Boolean {
+        val normalizedMime = mimeType?.trim()?.lowercase().orEmpty()
+        if (normalizedMime.startsWith("video/")) return true
+        val normalizedName = fileName?.trim()?.lowercase().orEmpty()
+        return VIDEO_EXTENSIONS.any { normalizedName.endsWith(it) }
+    }
 
     fun albumGroupOf(type: CloneMessageType): AlbumCompatibilityGroup? = when (type) {
         CloneMessageType.PHOTO,
@@ -81,10 +96,9 @@ object CloneBatchPlanner {
     /**
      * Converts chronologically ordered messages into SendUnits:
      * - Skips non-forwardable (`!canBeSaved`) or unsupported/filtered messages without blocking.
-     * - Groups consecutive messages sharing `mediaAlbumId != 0L`.
-     * - Separates incompatible media types (e.g. Photo/Video cannot mix with Document/Audio).
+     * - Groups consecutive messages sharing `mediaAlbumId != 0L` within the same `targetThreadId`.
+     * - Separates incompatible media types (`Document`/`Audio` separated from `Photo`/`Video`).
      * - Splits albums larger than 10 items into sub-albums of at most 10 items.
-     * - Marks split/mixed sub-albums as `requiresIsolatedCall = true` so TDLib forwards each sub-album separately.
      */
     fun <T> buildSendUnits(
         messages: List<CloneableMessage<T>>,
@@ -92,8 +106,6 @@ object CloneBatchPlanner {
     ): List<SendUnit<T>> {
         if (messages.isEmpty()) return emptyList()
 
-        // Filter out non-forwardable/system/disabled messages first so a system message in the
-        // middle of an album never splits that album into separate sends.
         val forwardable = messages
             .asSequence()
             .filter { it.canBeSaved && isAllowedBySettings(it.type, settings) }
@@ -109,8 +121,12 @@ object CloneBatchPlanner {
             val current = forwardable[index]
             if (current.mediaAlbumId != 0L) {
                 val albumId = current.mediaAlbumId
+                val threadId = current.targetThreadId
                 val rawRun = mutableListOf<CloneableMessage<T>>()
-                while (index < forwardable.size && forwardable[index].mediaAlbumId == albumId) {
+                while (index < forwardable.size &&
+                    forwardable[index].mediaAlbumId == albumId &&
+                    forwardable[index].targetThreadId == threadId
+                ) {
                     rawRun.add(forwardable[index])
                     index++
                 }
@@ -162,7 +178,8 @@ object CloneBatchPlanner {
 
     /**
      * Groups SendUnits into execution blocks of up to [blockSize] messages.
-     * When [preserveAlbumIntegrity] is true, an album (`SendUnit`) is never split across block boundaries.
+     * - Never mixes messages from different `targetThreadId` topics in the same block.
+     * - When [preserveAlbumIntegrity] is true, never splits an album across block boundaries.
      */
     fun <T> buildBlocks(
         units: List<SendUnit<T>>,
@@ -175,10 +192,10 @@ object CloneBatchPlanner {
         val blocks = mutableListOf<CloneBlock<T>>()
         val currentUnits = mutableListOf<SendUnit<T>>()
         var currentCount = 0
+        var currentTopicId: Long? = null
 
-        for (unit in units) {
-            val wouldExceed = currentCount + unit.size > safeBlockSize
-            if (currentUnits.isNotEmpty() && (currentCount >= safeBlockSize || (preserveAlbumIntegrity && wouldExceed))) {
+        fun flushBlock() {
+            if (currentUnits.isNotEmpty()) {
                 blocks.add(
                     CloneBlock(
                         units = currentUnits.toList(),
@@ -187,10 +204,21 @@ object CloneBatchPlanner {
                 )
                 currentUnits.clear()
                 currentCount = 0
+                currentTopicId = null
+            }
+        }
+
+        for (unit in units) {
+            val topicChanged = currentTopicId != null && currentTopicId != unit.targetThreadId
+            val wouldExceed = currentCount + unit.size > safeBlockSize
+
+            if (currentUnits.isNotEmpty() &&
+                (topicChanged || currentCount >= safeBlockSize || (preserveAlbumIntegrity && wouldExceed))
+            ) {
+                flushBlock()
             }
 
             if (!preserveAlbumIntegrity && unit.size > safeBlockSize && currentUnits.isEmpty()) {
-                // Only if integrity preservation is explicitly disabled, split unit items into blockSize pieces
                 unit.items.chunked(safeBlockSize).forEach { piece ->
                     val pieceUnit = SendUnit(piece, requiresIsolatedCall = unit.requiresIsolatedCall)
                     blocks.add(
@@ -203,24 +231,18 @@ object CloneBatchPlanner {
             } else {
                 currentUnits.add(unit)
                 currentCount += unit.size
+                currentTopicId = unit.targetThreadId
             }
         }
 
-        if (currentUnits.isNotEmpty()) {
-            blocks.add(
-                CloneBlock(
-                    units = currentUnits.toList(),
-                    tdLibCalls = sliceUnitsIntoTdLibCalls(currentUnits),
-                )
-            )
-        }
-
+        flushBlock()
         return blocks
     }
 
     /**
      * Slices a block's SendUnits into sequential TDLib `ForwardMessages` calls of at most [maxIdsPerCall] (100) IDs.
-     * Never splits an album (`SendUnit`) across a call boundary, and isolates split/mixed album sub-units.
+     * - Never mixes different `targetThreadId` topics in the same call.
+     * - Never splits an album across a call boundary, and isolates split/mixed album sub-units.
      */
     fun <T> sliceUnitsIntoTdLibCalls(
         units: List<SendUnit<T>>,
@@ -231,11 +253,13 @@ object CloneBatchPlanner {
 
         val calls = mutableListOf<TdLibCallBatch<T>>()
         val buffer = mutableListOf<CloneableMessage<T>>()
+        var bufferTopicId: Long? = null
 
         fun flushBuffer() {
             if (buffer.isNotEmpty()) {
                 calls.add(TdLibCallBatch(buffer.toList()))
                 buffer.clear()
+                bufferTopicId = null
             }
         }
 
@@ -246,7 +270,8 @@ object CloneBatchPlanner {
                     calls.add(TdLibCallBatch(part))
                 }
             } else {
-                if (buffer.isNotEmpty() && buffer.size + unit.size > safeMax) {
+                val topicChanged = bufferTopicId != null && bufferTopicId != unit.targetThreadId
+                if (buffer.isNotEmpty() && (topicChanged || buffer.size + unit.size > safeMax)) {
                     flushBuffer()
                 }
                 if (unit.size > safeMax) {
@@ -255,6 +280,7 @@ object CloneBatchPlanner {
                     }
                 } else {
                     buffer.addAll(unit.items)
+                    bufferTopicId = unit.targetThreadId
                 }
             }
         }
@@ -268,7 +294,7 @@ object CloneBatchPlanner {
         maxDelayMs: Long,
         random: Random = Random.Default,
     ): Long {
-        val safeMin = minDelayMs.coerceAtLeast(1L)
+        val safeMin = minDelayMs.coerceAtLeast(0L)
         val safeMax = maxDelayMs.coerceAtLeast(safeMin)
         return if (safeMin == safeMax) {
             safeMin

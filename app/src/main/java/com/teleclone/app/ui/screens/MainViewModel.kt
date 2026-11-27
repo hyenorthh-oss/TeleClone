@@ -35,6 +35,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val database = AppDatabase.getInstance(application)
     private val dao = database.cloneTaskDao()
+    private val messageDao = database.cloneMessageDao()
     private val settingsDataStore = SettingsDataStore(application)
 
     val authState: StateFlow<AuthState> = TdLibManager.authState
@@ -271,7 +272,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startCloning(context: Context, source: TelegramChatItem, target: TelegramChatItem) {
         val currentActive = serviceProgress.value.activeTask ?: activeDbTask.value
-        if (currentActive?.status == CloneTaskStatus.RUNNING) return
+        if (CloneTaskStatus.isActiveOrRunning(currentActive?.status) ||
+            currentActive?.status == CloneTaskStatus.COMPLETED
+        ) {
+            return
+        }
         if (source.id == target.id) return
 
         val config = _batchModeConfig.value
@@ -287,7 +292,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (config.isBatchMode) {
-            val minMs = ((validation.jitterMinSeconds ?: 5.0) * 1000.0).toLong().coerceAtLeast(1L)
+            val minMs = ((validation.jitterMinSeconds ?: 5.0) * 1000.0).toLong().coerceAtLeast(0L)
             val maxMs = ((validation.jitterMaxSeconds ?: 8.0) * 1000.0).toLong().coerceAtLeast(minMs)
             CloneForegroundService.startCloning(
                 context = context,
@@ -326,10 +331,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val task = serviceProgress.value.activeTask ?: activeDbTask.value
             if (task != null) {
                 withContext(Dispatchers.IO) {
+                    messageDao.deleteForTask(task.id)
                     dao.deleteById(task.id)
                 }
             }
             CloneForegroundService.cancelCloning(context)
+        }
+    }
+
+    fun acknowledgeCompletedTask(context: Context) {
+        viewModelScope.launch {
+            val task = serviceProgress.value.activeTask ?: activeDbTask.value
+            CloneForegroundService.dismissCompleted(context)
+            if (task != null) {
+                withContext(Dispatchers.IO) {
+                    messageDao.deleteForTask(task.id)
+                    dao.updateStatus(task.id, CloneTaskStatus.ARCHIVED, System.currentTimeMillis())
+                }
+            }
         }
     }
 
