@@ -659,22 +659,71 @@ class CloneSessionRunner<T>(
         statusPrefix: String,
     ): CloneTaskEntity {
         var currentTask = startTask
-        val itemMap = items.associateBy { it.id }
-        var remainingIds = items.map { it.id }
-        var transientRetryIndex = 0
-        val forceProtectedIds = mutableSetOf<Long>()
+        val initialProtectedIds = mutableSetOf<Long>()
 
         if (sourceChatProtected) {
-            forceProtectedIds.addAll(remainingIds)
+            initialProtectedIds.addAll(items.map { it.id })
         } else {
             for (msg in items) {
                 val canFwd = runCatching {
                     gateway.canForwardMessage(currentTask.sourceChatId, msg)
                 }.getOrDefault(msg.canBeForwarded)
                 if (!canFwd) {
-                    forceProtectedIds.add(msg.id)
+                    initialProtectedIds.add(msg.id)
                 }
             }
+            // Keep album intact if any item in an album requires protected reupload
+            val protectedAlbums = items.filter { initialProtectedIds.contains(it.id) && it.mediaAlbumId != 0L }
+                .map { it.mediaAlbumId }
+                .toSet()
+            if (protectedAlbums.isNotEmpty()) {
+                items.filter { protectedAlbums.contains(it.mediaAlbumId) }
+                    .forEach { initialProtectedIds.add(it.id) }
+            }
+        }
+
+        // Split into contiguous chronological runs of forwardable vs protected items
+        val runs = mutableListOf<Pair<Boolean, List<CloneableMessage<T>>>>()
+        var currentRunProtected: Boolean? = null
+        var currentRunItems = mutableListOf<CloneableMessage<T>>()
+        for (msg in items) {
+            val isProt = initialProtectedIds.contains(msg.id)
+            if (currentRunProtected != null && currentRunProtected != isProt && currentRunItems.isNotEmpty()) {
+                runs.add(currentRunProtected to currentRunItems.toList())
+                currentRunItems = mutableListOf()
+            }
+            currentRunProtected = isProt
+            currentRunItems.add(msg)
+        }
+        if (currentRunProtected != null && currentRunItems.isNotEmpty()) {
+            runs.add(currentRunProtected to currentRunItems.toList())
+        }
+
+        for ((startsProtected, runItems) in runs) {
+            if (!currentCoroutineContext().isActive) throw CancellationException("Cancelled")
+            currentTask = dispatchSingleHomogeneousRun(
+                startTask = currentTask,
+                items = runItems,
+                initialForceProtected = startsProtected,
+                statusPrefix = statusPrefix,
+            )
+        }
+        return currentTask
+    }
+
+    private suspend fun dispatchSingleHomogeneousRun(
+        startTask: CloneTaskEntity,
+        items: List<CloneableMessage<T>>,
+        initialForceProtected: Boolean,
+        statusPrefix: String,
+    ): CloneTaskEntity {
+        var currentTask = startTask
+        val itemMap = items.associateBy { it.id }
+        var remainingIds = items.map { it.id }
+        var transientRetryIndex = 0
+        val forceProtectedIds = mutableSetOf<Long>()
+        if (initialForceProtected) {
+            forceProtectedIds.addAll(remainingIds)
         }
 
         while (remainingIds.isNotEmpty() && currentCoroutineContext().isActive) {
@@ -683,7 +732,7 @@ class CloneSessionRunner<T>(
             if (remainingItems.isEmpty()) break
 
             val targetThreadId = remainingItems.first().targetThreadId
-            val useProtectedReupload = remainingItems.any { forceProtectedIds.contains(it.id) }
+            val useProtectedReupload = remainingItems.all { forceProtectedIds.contains(it.id) }
 
             emitProgress(
                 currentTask,
@@ -823,12 +872,15 @@ class CloneSessionRunner<T>(
                 )
             }
 
-            val nextMissing = mutableListOf<Long>()
             if (drain.restrictedSourceIds.isNotEmpty()) {
                 val newlyProtected = drain.restrictedSourceIds.filter { !forceProtectedIds.contains(it) }
                 if (newlyProtected.isNotEmpty()) {
-                    forceProtectedIds.addAll(newlyProtected)
-                    nextMissing.addAll(newlyProtected)
+                    currentTask = dispatchSingleHomogeneousRun(
+                        startTask = currentTask,
+                        items = newlyProtected.sorted().mapNotNull { itemMap[it] },
+                        initialForceProtected = true,
+                        statusPrefix = statusPrefix,
+                    )
                 } else {
                     store.markFailedPermanent(
                         currentTask.id,
@@ -843,20 +895,12 @@ class CloneSessionRunner<T>(
                 }
             }
 
-            if (drain.retryableSourceIds.isNotEmpty()) {
-                nextMissing.addAll(drain.retryableSourceIds)
-            }
-
+            val nextMissing = drain.retryableSourceIds
             if (nextMissing.isEmpty()) {
                 break
             }
 
             remainingIds = nextMissing.sorted()
-
-            // If we only moved restricted items into forceProtectedIds without failing, retry immediately via reuploader
-            if (drain.retryableSourceIds.isEmpty() && drain.floodWaitSeconds == null) {
-                continue
-            }
 
             val floodWait = drain.floodWaitSeconds
             if (floodWait != null) {
