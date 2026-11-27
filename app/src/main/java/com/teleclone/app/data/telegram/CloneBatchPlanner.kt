@@ -92,30 +92,31 @@ object CloneBatchPlanner {
     ): List<SendUnit<T>> {
         if (messages.isEmpty()) return emptyList()
 
-        val sorted = messages.sortedBy { it.id }
+        // Filter out non-forwardable/system/disabled messages first so a system message in the
+        // middle of an album never splits that album into separate sends.
+        val forwardable = messages
+            .asSequence()
+            .filter { it.canBeSaved && isAllowedBySettings(it.type, settings) }
+            .sortedBy { it.id }
+            .toList()
+
+        if (forwardable.isEmpty()) return emptyList()
+
         val units = mutableListOf<SendUnit<T>>()
         var index = 0
 
-        while (index < sorted.size) {
-            val current = sorted[index]
+        while (index < forwardable.size) {
+            val current = forwardable[index]
             if (current.mediaAlbumId != 0L) {
                 val albumId = current.mediaAlbumId
                 val rawRun = mutableListOf<CloneableMessage<T>>()
-                while (index < sorted.size && sorted[index].mediaAlbumId == albumId) {
-                    val item = sorted[index]
-                    if (item.canBeSaved && isAllowedBySettings(item.type, settings)) {
-                        rawRun.add(item)
-                    }
+                while (index < forwardable.size && forwardable[index].mediaAlbumId == albumId) {
+                    rawRun.add(forwardable[index])
                     index++
                 }
-                if (rawRun.isEmpty()) continue
-
-                val subUnits = splitAlbumRunIntoCompatibleUnits(rawRun)
-                units.addAll(subUnits)
+                units.addAll(splitAlbumRunIntoCompatibleUnits(rawRun))
             } else {
-                if (current.canBeSaved && isAllowedBySettings(current.type, settings)) {
-                    units.add(SendUnit(items = listOf(current), requiresIsolatedCall = false))
-                }
+                units.add(SendUnit(items = listOf(current), requiresIsolatedCall = false))
                 index++
             }
         }

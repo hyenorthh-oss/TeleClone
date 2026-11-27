@@ -182,7 +182,7 @@ class CloneEngineIntegrationTest {
             status = CloneTaskStatus.RUNNING,
             updatedAt = 0L,
             isBatchMode = true,
-            batchBlockSize = 250,
+            batchBlockSize = 150,
             batchJitterMinMs = 5_000L,
             batchJitterMaxMs = 8_000L,
             preserveAlbumIntegrity = true,
@@ -241,7 +241,7 @@ class CloneEngineIntegrationTest {
         var callsCount = 0
         var pausedJob: kotlinx.coroutines.Job? = null
 
-        // Trigger pause cleanly when call #3 begins (so calls 1 & 2 are already persisted!)
+        // Trigger pause cleanly when call #4 begins (Block 1 = 100+50, Block 2 starts with 45 -> 195 persisted!)
         val pausingTransport = object : CloneTransport<Long> by transport {
             override suspend fun forwardCopyClean(
                 sourceChatId: Long,
@@ -251,7 +251,7 @@ class CloneEngineIntegrationTest {
                 onStatusUpdate: suspend (String) -> Unit,
             ): Int {
                 callsCount++
-                if (callsCount == 3) {
+                if (callsCount == 4) {
                     pausedJob?.cancel(CancellationException("User paused"))
                     suspendCancellableCoroutine<Unit> { }
                 }
