@@ -20,7 +20,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 import java.io.File
@@ -46,9 +46,16 @@ class TdLibException(
     }
 }
 
+data class HistoryBatchResult(
+    val messages: List<TdApi.Message>,
+    val maxScannedMessageId: Long,
+    val isProtectedChat: Boolean = false,
+)
+
 object TdLibManager {
 
     private const val TAG = "TdLibManager"
+    private const val QUERY_TIMEOUT_MS = CloneReliabilityExecutor.DEFAULT_TIMEOUT_MS
 
     private lateinit var appContext: Context
     private lateinit var settingsDataStore: SettingsDataStore
@@ -62,7 +69,6 @@ object TdLibManager {
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
     private val fileDownloadWaiters = ConcurrentHashMap<Int, CompletableDeferred<TdApi.File>>()
-    private val sendMessageWaiters = ConcurrentHashMap<Long, CompletableDeferred<TdApi.Message>>()
 
     @Volatile
     private var waitingTdlibParameters = false
@@ -91,13 +97,6 @@ object TdLibManager {
                 if (file.local.isDownloadingCompleted && file.local.path.isNotBlank()) {
                     fileDownloadWaiters.remove(file.id)?.complete(file)
                 }
-            }
-            is TdApi.UpdateMessageSendSucceeded -> {
-                sendMessageWaiters.remove(update.oldMessageId)?.complete(update.message)
-            }
-            is TdApi.UpdateMessageSendFailed -> {
-                val err = TdLibException(update.error.code, update.error.message)
-                sendMessageWaiters.remove(update.oldMessageId)?.completeExceptionally(err)
             }
         }
     }
@@ -159,7 +158,7 @@ object TdLibManager {
             applicationVersion = "1.0.0"
         }
         try {
-            sendQuery(params)
+            sendQueryWithTimeout(params)
         } catch (e: Exception) {
             _authState.value = AuthState.Error(e.message ?: "Credenciais da API inválidas")
         }
@@ -188,7 +187,7 @@ object TdLibManager {
         return try {
             _authState.value = AuthState.Loading
             settingsDataStore.savePhoneNumber(normalized)
-            sendQuery(TdApi.SetAuthenticationPhoneNumber(normalized, null))
+            sendQueryWithTimeout(TdApi.SetAuthenticationPhoneNumber(normalized, null))
             Result.success(Unit)
         } catch (e: Exception) {
             _authState.value = AuthState.Error(e.message ?: "Número de telefone inválido")
@@ -199,7 +198,7 @@ object TdLibManager {
     suspend fun submitCode(code: String): Result<Unit> {
         return try {
             _authState.value = AuthState.Loading
-            sendQuery(TdApi.CheckAuthenticationCode(code.trim()))
+            sendQueryWithTimeout(TdApi.CheckAuthenticationCode(code.trim()))
             Result.success(Unit)
         } catch (e: Exception) {
             _authState.value = AuthState.Error(e.message ?: "Código de verificação inválido")
@@ -210,7 +209,7 @@ object TdLibManager {
     suspend fun submitPassword(password: String): Result<Unit> {
         return try {
             _authState.value = AuthState.Loading
-            sendQuery(TdApi.CheckAuthenticationPassword(password))
+            sendQueryWithTimeout(TdApi.CheckAuthenticationPassword(password))
             Result.success(Unit)
         } catch (e: Exception) {
             _authState.value = AuthState.Error(e.message ?: "Senha 2FA incorreta")
@@ -222,7 +221,7 @@ object TdLibManager {
         return try {
             _authState.value = AuthState.Loading
             settingsDataStore.clearSessionCredentials()
-            sendQuery(TdApi.LogOut())
+            sendQueryWithTimeout(TdApi.LogOut())
             Result.success(Unit)
         } catch (e: Exception) {
             _authState.value = AuthState.Error(e.message ?: "Falha ao encerrar sessão")
@@ -249,9 +248,18 @@ object TdLibManager {
             }
         }
 
+    suspend fun <T : TdApi.Object> sendQueryWithTimeout(
+        query: TdApi.Function<T>,
+        timeoutMs: Long = QUERY_TIMEOUT_MS,
+    ): T {
+        return withTimeoutOrNull(timeoutMs) {
+            sendQuery(query)
+        } ?: throw TdLibTimeoutException("Tempo limite (${timeoutMs / 1000}s) excedido na TDLib")
+    }
+
     suspend fun getCurrentUserProfile(): UserProfile? {
         return try {
-            val user = sendQuery(TdApi.GetMe())
+            val user = sendQueryWithTimeout(TdApi.GetMe())
             val avatarPath = user.profilePhoto?.small?.let { smallFile ->
                 ensureLocalFile(smallFile)?.absolutePath
             }
@@ -277,12 +285,12 @@ object TdLibManager {
 
     suspend fun loadUserChats(): List<TelegramChatItem> = coroutineScope {
         try {
-            sendQuery(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+            sendQueryWithTimeout(TdApi.LoadChats(TdApi.ChatListMain(), 100))
         } catch (_: TdLibException) {
             // 404 means all chats in the list are already loaded
         }
 
-        val chats = sendQuery(TdApi.GetChats(TdApi.ChatListMain(), 100))
+        val chats = sendQueryWithTimeout(TdApi.GetChats(TdApi.ChatListMain(), 100))
         val chatIds = chats.chatIds.toList()
 
         chatIds.chunked(10).flatMap { chunk ->
@@ -295,7 +303,7 @@ object TdLibManager {
     }
 
     private suspend fun buildChatItem(chatId: Long): TelegramChatItem {
-        val chat = sendQuery(TdApi.GetChat(chatId))
+        val chat = sendQueryWithTimeout(TdApi.GetChat(chatId))
         var memberCount = 0
         var isChannel = false
         var canSend = false
@@ -303,7 +311,7 @@ object TdLibManager {
         when (val type = chat.type) {
             is TdApi.ChatTypeSupergroup -> {
                 isChannel = type.isChannel
-                val sg = runCatching { sendQuery(TdApi.GetSupergroup(type.supergroupId)) }.getOrNull()
+                val sg = runCatching { sendQueryWithTimeout(TdApi.GetSupergroup(type.supergroupId)) }.getOrNull()
                 if (sg != null) {
                     memberCount = sg.memberCount
                     canSend = when (val status = sg.status) {
@@ -322,7 +330,7 @@ object TdLibManager {
                 }
             }
             is TdApi.ChatTypeBasicGroup -> {
-                val bg = runCatching { sendQuery(TdApi.GetBasicGroup(type.basicGroupId)) }.getOrNull()
+                val bg = runCatching { sendQueryWithTimeout(TdApi.GetBasicGroup(type.basicGroupId)) }.getOrNull()
                 if (bg != null) {
                     memberCount = bg.memberCount
                     canSend = when (val status = bg.status) {
@@ -364,7 +372,7 @@ object TdLibManager {
 
     suspend fun getChatMessageCountEstimate(chatId: Long): Int {
         return runCatching {
-            sendQuery(
+            sendQueryWithTimeout(
                 TdApi.GetChatMessageCount(
                     chatId,
                     null,
@@ -376,73 +384,59 @@ object TdLibManager {
     }
 
     /**
-     * Fetches a batch of messages in chronological order (oldest -> newest) starting strictly after [fromMessageId].
-     * Respects platform content protection permissions by skipping messages where copying/saving is disallowed.
+     * Fetches chronological messages strictly after [fromMessageId], continuing across page
+     * boundaries if the last message of a page belongs to an album (`mediaAlbumId != 0L`)
+     * or until [desiredForwardableCount] is reached.
+     *
+     * Respects platform content protection permissions and skips non-forwardable system messages.
      */
     suspend fun fetchHistoryBatch(
         chatId: Long,
         fromMessageId: Long,
-        limit: Int = 50,
-    ): List<TdApi.Message> {
-        val chat = sendQuery(TdApi.GetChat(chatId))
-        if (chat.hasProtectedContent) {
-            return emptyList()
-        }
-
-        val safeLimit = limit.coerceIn(1, 99)
-        var cursorId = if (fromMessageId > 0L) fromMessageId else 1L
-
-        while (true) {
-            val result = sendQuery(
-                TdApi.GetChatHistory(
-                    chatId,
-                    cursorId,
-                    -safeLimit,
-                    safeLimit,
-                    false,
+        desiredForwardableCount: Int = 50,
+    ): HistoryBatchResult {
+        val paginated = HistoryPagePaginator.fetchBatch(
+            fromMessageId = fromMessageId,
+            desiredForwardableCount = desiredForwardableCount,
+            isChatProtected = {
+                val chat = sendQueryWithTimeout(TdApi.GetChat(chatId))
+                if (chat.hasProtectedContent) {
+                    Log.w(TAG, "Source chat $chatId has protected content; skipping forward.")
+                    true
+                } else {
+                    false
+                }
+            },
+            fetchPage = { cursorId, limit ->
+                val result = sendQueryWithTimeout(
+                    TdApi.GetChatHistory(
+                        chatId,
+                        cursorId,
+                        -limit,
+                        limit,
+                        false,
+                    )
                 )
-            )
-            var rawMessages = result.messages?.toList().orEmpty()
-
-            // Fallback when starting from 0L if querying from ID 1 with negative offset returns empty
-            if (rawMessages.isEmpty() && cursorId == 1L) {
-                rawMessages = fetchOldestMessagesFallback(chatId, safeLimit)
-            }
-
-            if (rawMessages.isEmpty()) {
-                return emptyList()
-            }
-
-            val ordered = rawMessages
-                .filter { it.id > fromMessageId && it.id > cursorId.coerceAtLeast(0L) || (fromMessageId == 0L && cursorId == 1L) }
-                .sortedBy { it.id }
-
-            if (ordered.isEmpty()) {
-                return emptyList()
-            }
-
-            val allowed = ordered.filter { msg ->
-                msg.canBeSaved && isSupportedContent(msg.content)
-            }
-
-            if (allowed.isNotEmpty()) {
-                return allowed
-            }
-
-            // Entire batch was restricted or unsupported service messages; advance cursor and continue
-            val maxIdInBatch = ordered.last().id
-            if (maxIdInBatch <= cursorId) {
-                return emptyList()
-            }
-            cursorId = maxIdInBatch
-        }
+                result.messages?.toList().orEmpty().map { toCloneableMessage(it) }
+            },
+            fetchOldestFallback = { limit ->
+                fetchOldestMessagesFallback(chatId, limit).map { toCloneableMessage(it) }
+            },
+        )
+        return HistoryBatchResult(
+            messages = paginated.messages.map { it.payload },
+            maxScannedMessageId = paginated.maxScannedMessageId,
+            isProtectedChat = paginated.isProtectedChat,
+        )
     }
 
     private suspend fun fetchOldestMessagesFallback(chatId: Long, limit: Int): List<TdApi.Message> {
         var walkFrom = 0L
         var oldestBatch: List<TdApi.Message> = emptyList()
-        while (true) {
-            val res = sendQuery(TdApi.GetChatHistory(chatId, walkFrom, 0, limit, false))
+        var steps = 0
+        while (steps < 200) {
+            steps++
+            val res = sendQueryWithTimeout(TdApi.GetChatHistory(chatId, walkFrom, 0, limit, false))
             val list = res.messages?.toList().orEmpty()
             if (list.isEmpty()) break
             oldestBatch = list
@@ -453,24 +447,31 @@ object TdLibManager {
         return oldestBatch
     }
 
-    private fun isSupportedContent(content: TdApi.MessageContent): Boolean {
-        return when (content) {
-            is TdApi.MessageText,
-            is TdApi.MessagePhoto,
-            is TdApi.MessageVideo,
-            is TdApi.MessageAudio,
-            is TdApi.MessageDocument,
-            is TdApi.MessageVoiceNote,
-            is TdApi.MessageAnimation -> true
-            else -> false
+    fun toCloneableMessage(msg: TdApi.Message): CloneableMessage<TdApi.Message> {
+        val type = when (msg.content) {
+            is TdApi.MessageText -> CloneMessageType.TEXT
+            is TdApi.MessagePhoto -> CloneMessageType.PHOTO
+            is TdApi.MessageVideo -> CloneMessageType.VIDEO
+            is TdApi.MessageAudio -> CloneMessageType.AUDIO
+            is TdApi.MessageDocument -> CloneMessageType.DOCUMENT
+            is TdApi.MessageVoiceNote -> CloneMessageType.VOICE_NOTE
+            is TdApi.MessageAnimation -> CloneMessageType.ANIMATION
+            else -> CloneMessageType.UNSUPPORTED
         }
+        return CloneableMessage(
+            id = msg.id,
+            mediaAlbumId = msg.mediaAlbumId,
+            canBeSaved = msg.canBeSaved,
+            type = type,
+            payload = msg,
+        )
     }
 
     /**
      * Downloads an avatar file into TDLib's internal directory waiting for completion via UpdateFile.
      */
     private suspend fun downloadAvatarFile(fileId: Int): File {
-        val existing = sendQuery(TdApi.GetFile(fileId))
+        val existing = sendQueryWithTimeout(TdApi.GetFile(fileId))
         val completedFile = if (existing.local.isDownloadingCompleted &&
             existing.local.path.isNotBlank() &&
             File(existing.local.path).exists()
@@ -480,7 +481,7 @@ object TdLibManager {
             val waiter = CompletableDeferred<TdApi.File>()
             fileDownloadWaiters[fileId] = waiter
             try {
-                val triggered = sendQuery(TdApi.DownloadFile(fileId, 16, 0L, 0L, false))
+                val triggered = sendQueryWithTimeout(TdApi.DownloadFile(fileId, 16, 0L, 0L, false))
                 if (triggered.local.isDownloadingCompleted &&
                     triggered.local.path.isNotBlank() &&
                     File(triggered.local.path).exists()
@@ -488,9 +489,9 @@ object TdLibManager {
                     fileDownloadWaiters.remove(fileId)
                     triggered
                 } else {
-                    withTimeout(60_000L) {
+                    withTimeoutOrNull(25_000L) {
                         waiter.await()
-                    }
+                    } ?: throw TdLibTimeoutException("Timeout ao baixar avatar")
                 }
             } finally {
                 fileDownloadWaiters.remove(fileId)
@@ -518,20 +519,12 @@ object TdLibManager {
         return cleaned.trim()
     }
 
-    private fun isMessageAllowedBySettings(message: TdApi.Message, settings: CloneSettings): Boolean {
-        return when (message.content) {
-            is TdApi.MessageText -> settings.includeText
-            is TdApi.MessagePhoto -> settings.includePhotos
-            is TdApi.MessageVideo, is TdApi.MessageAnimation -> settings.includeVideos
-            is TdApi.MessageAudio, is TdApi.MessageVoiceNote -> settings.includeAudio
-            is TdApi.MessageDocument -> settings.includeDocuments
-            else -> false
-        }
-    }
-
     /**
      * Copies messages cloud-to-cloud directly on Telegram servers without the "Forwarded from" tag
-     * using ForwardMessages(sendCopy = true, removeCaption = false).
+     * using `ForwardMessages(sendCopy = true, removeCaption = false)` with a 25s timeout.
+     *
+     * Never blocks waiting indefinitely for `UpdateMessageSendSucceeded` on album items:
+     * as soon as `TdApi.Messages` returns without error, all items are accounted for immediately.
      */
     suspend fun forwardCopyClean(
         sourceChatId: Long,
@@ -540,11 +533,14 @@ object TdLibManager {
         settings: CloneSettings,
         onStatusUpdate: (String) -> Unit,
     ): Int {
-        val allowed = messages.filter { isMessageAllowedBySettings(it, settings) }
-        if (allowed.isEmpty()) return 0
+        if (messages.isEmpty()) return 0
 
         onStatusUpdate(
-            if (allowed.size > 1) "Enviando álbum..." else "Enviando mensagem..."
+            when {
+                messages.size > 10 -> "Enviando bloco (${messages.size} msgs)..."
+                messages.size > 1 -> "Enviando álbum (${messages.size} itens)..."
+                else -> "Enviando mensagem..."
+            }
         )
 
         val sendOptions = TdApi.MessageSendOptions().apply {
@@ -561,26 +557,27 @@ object TdLibManager {
             chatId = targetChatId
             topicId = null
             fromChatId = sourceChatId
-            messageIds = allowed.map { it.id }.toLongArray()
+            messageIds = messages.map { it.id }.toLongArray()
             options = sendOptions
             sendCopy = true
             removeCaption = false
         }
 
-        val forwarded = sendQuery(forwardReq)
+        val forwarded = sendQueryWithTimeout(forwardReq, QUERY_TIMEOUT_MS)
         val copiedMessages = forwarded.messages
             ?.filterNotNull()
-            ?.map { awaitMessageSent(it) }
             .orEmpty()
 
         val shouldModifyText = settings.stripMentionsAndLinks || settings.customSignature.isNotBlank()
         if (shouldModifyText) {
             for (copiedMsg in copiedMessages) {
-                applyTextCleanupIfNeeded(targetChatId, copiedMsg, settings)
+                if (copiedMsg.sendingState == null && copiedMsg.id > 0L) {
+                    applyTextCleanupIfNeeded(targetChatId, copiedMsg, settings)
+                }
             }
         }
 
-        return if (copiedMessages.isNotEmpty()) copiedMessages.size else allowed.size
+        return if (copiedMessages.isNotEmpty()) copiedMessages.size else messages.size
     }
 
     private suspend fun applyTextCleanupIfNeeded(
@@ -599,7 +596,7 @@ object TdLibManager {
                             settings.customSignature,
                         )
                         if (cleaned.isNotBlank() && cleaned != originalText) {
-                            sendQuery(
+                            sendQueryWithTimeout(
                                 TdApi.EditMessageText().apply {
                                     chatId = targetChatId
                                     messageId = copiedMsg.id
@@ -638,6 +635,8 @@ object TdLibManager {
                 throw e
             }
             Log.w(TAG, "Skipping post-copy text edit on message ${copiedMsg.id}: ${e.message}")
+        } catch (e: TdLibTimeoutException) {
+            Log.w(TAG, "Timeout editing post-copy text on message ${copiedMsg.id}: ${e.message}")
         }
     }
 
@@ -655,7 +654,7 @@ object TdLibManager {
             settings.customSignature,
         )
         if (cleaned != originalCaption) {
-            sendQuery(
+            sendQueryWithTimeout(
                 TdApi.EditMessageCaption().apply {
                     chatId = targetChatId
                     this.messageId = messageId
@@ -664,19 +663,6 @@ object TdLibManager {
                     showCaptionAboveMedia = showAboveMedia
                 }
             )
-        }
-    }
-
-    private suspend fun awaitMessageSent(message: TdApi.Message): TdApi.Message {
-        if (message.sendingState == null) return message
-        val deferred = CompletableDeferred<TdApi.Message>()
-        sendMessageWaiters[message.id] = deferred
-        return try {
-            withTimeout(300_000L) {
-                deferred.await()
-            }
-        } finally {
-            sendMessageWaiters.remove(message.id)
         }
     }
 }

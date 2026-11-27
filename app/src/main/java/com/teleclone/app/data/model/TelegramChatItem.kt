@@ -1,5 +1,8 @@
 package com.teleclone.app.data.model
 
+import androidx.compose.runtime.Immutable
+
+@Immutable
 data class TelegramChatItem(
     val id: Long,
     val title: String,

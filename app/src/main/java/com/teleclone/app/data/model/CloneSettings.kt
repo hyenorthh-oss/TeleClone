@@ -1,5 +1,8 @@
 package com.teleclone.app.data.model
 
+import androidx.compose.runtime.Immutable
+
+@Immutable
 data class CloneSettings(
     val delaySeconds: Float = 2.5f,
     val includeText: Boolean = true,

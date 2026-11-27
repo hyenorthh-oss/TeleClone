@@ -7,9 +7,13 @@ import androidx.lifecycle.viewModelScope
 import com.teleclone.app.data.local.AppDatabase
 import com.teleclone.app.data.local.SettingsDataStore
 import com.teleclone.app.data.model.AuthState
+import com.teleclone.app.data.model.BatchModeConfig
+import com.teleclone.app.data.model.BatchModeValidator
+import com.teleclone.app.data.model.BatchValidationResult
 import com.teleclone.app.data.model.CloneProgressState
 import com.teleclone.app.data.model.CloneSettings
 import com.teleclone.app.data.model.CloneTaskEntity
+import com.teleclone.app.data.model.CloneTaskStatus
 import com.teleclone.app.data.model.TelegramChatItem
 import com.teleclone.app.data.model.UserProfile
 import com.teleclone.app.data.telegram.TdLibManager
@@ -19,7 +23,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -33,15 +40,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val authState: StateFlow<AuthState> = TdLibManager.authState
 
     val cloneSettings: StateFlow<CloneSettings> = settingsDataStore.cloneSettingsFlow
+        .flowOn(Dispatchers.IO)
         .stateIn(viewModelScope, SharingStarted.Eagerly, CloneSettings())
 
     val activeDbTask: StateFlow<CloneTaskEntity?> = dao.observeActiveTask()
+        .flowOn(Dispatchers.IO)
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     val totalClonedMessages: StateFlow<Int> = dao.observeTotalClonedMessages()
+        .flowOn(Dispatchers.IO)
         .stateIn(viewModelScope, SharingStarted.Eagerly, 0)
 
     val serviceProgress: StateFlow<CloneProgressState> = CloneForegroundService.progressState
+
+    private val _batchModeConfig = MutableStateFlow(BatchModeConfig())
+    val batchModeConfig: StateFlow<BatchModeConfig> = _batchModeConfig.asStateFlow()
+
+    val batchValidation: StateFlow<BatchValidationResult> = _batchModeConfig
+        .map { BatchModeValidator.validate(it) }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            BatchModeValidator.validate(BatchModeConfig()),
+        )
+
+    private val _selectedSourceId = MutableStateFlow<Long?>(null)
+    val selectedSourceId: StateFlow<Long?> = _selectedSourceId.asStateFlow()
+
+    private val _selectedTargetId = MutableStateFlow<Long?>(null)
+    val selectedTargetId: StateFlow<Long?> = _selectedTargetId.asStateFlow()
 
     private val _chats = MutableStateFlow<List<TelegramChatItem>>(emptyList())
     val chats: StateFlow<List<TelegramChatItem>> = _chats.asStateFlow()
@@ -90,6 +118,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshCacheSize()
     }
 
+    fun selectSourceChat(chatId: Long) {
+        _selectedSourceId.value = chatId
+    }
+
+    fun selectTargetChat(chatId: Long) {
+        _selectedTargetId.value = chatId
+    }
+
+    fun toggleBatchMode() {
+        _batchModeConfig.update { it.copy(isBatchMode = !it.isBatchMode) }
+    }
+
+    fun updateBatchBlockSize(text: String) {
+        val filtered = text.filter { it.isDigit() }
+        _batchModeConfig.update { it.copy(blockSizeText = filtered) }
+    }
+
+    fun updateBatchJitterMin(text: String) {
+        val filtered = text.filter { it.isDigit() || it == '.' || it == ',' }
+        _batchModeConfig.update { it.copy(jitterMinText = filtered) }
+    }
+
+    fun updateBatchJitterMax(text: String) {
+        val filtered = text.filter { it.isDigit() || it == '.' || it == ',' }
+        _batchModeConfig.update { it.copy(jitterMaxText = filtered) }
+    }
+
+    fun updateBatchAutoPauseFloodWait(enabled: Boolean) {
+        _batchModeConfig.update { it.copy(autoPauseFloodWait = enabled) }
+    }
+
+    fun updateBatchVariableJitter(enabled: Boolean) {
+        _batchModeConfig.update { it.copy(variableJitterEnabled = enabled) }
+    }
+
+    fun updateBatchPreserveAlbumIntegrity(enabled: Boolean) {
+        _batchModeConfig.update { it.copy(preserveAlbumIntegrity = enabled) }
+    }
+
+    fun updateBatchRiskAccepted(accepted: Boolean) {
+        _batchModeConfig.update { it.copy(riskAccepted = accepted) }
+    }
+
     fun submitApiCredentials(apiIdText: String, apiHash: String) {
         val parsedId = apiIdText.trim().toIntOrNull()
         if (parsedId == null || parsedId <= 0) {
@@ -102,7 +173,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _authError.value = null
         viewModelScope.launch {
-            val res = TdLibManager.submitApiCredentials(parsedId, apiHash)
+            val res = withContext(Dispatchers.IO) {
+                TdLibManager.submitApiCredentials(parsedId, apiHash)
+            }
             res.onFailure { _authError.value = it.message ?: "Erro ao validar API_ID / API_HASH" }
         }
     }
@@ -114,7 +187,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _authError.value = null
         viewModelScope.launch {
-            val res = TdLibManager.submitPhoneNumber(phone)
+            val res = withContext(Dispatchers.IO) {
+                TdLibManager.submitPhoneNumber(phone)
+            }
             res.onFailure { _authError.value = it.message ?: "Erro ao enviar telefone" }
         }
     }
@@ -126,7 +201,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _authError.value = null
         viewModelScope.launch {
-            val res = TdLibManager.submitCode(code)
+            val res = withContext(Dispatchers.IO) {
+                TdLibManager.submitCode(code)
+            }
             res.onFailure { _authError.value = it.message ?: "Código inválido" }
         }
     }
@@ -138,7 +215,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _authError.value = null
         viewModelScope.launch {
-            val res = TdLibManager.submitPassword(password)
+            val res = withContext(Dispatchers.IO) {
+                TdLibManager.submitPassword(password)
+            }
             res.onFailure { _authError.value = it.message ?: "Senha incorreta" }
         }
     }
@@ -158,7 +237,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isLoadingChats.value = true
             _chatsError.value = null
             try {
-                val loaded = TdLibManager.loadUserChats()
+                val loaded = withContext(Dispatchers.IO) {
+                    TdLibManager.loadUserChats()
+                }
                 _chats.value = loaded
             } catch (e: Exception) {
                 _chatsError.value = e.message ?: "Erro ao carregar canais"
@@ -170,26 +251,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshUserProfile() {
         viewModelScope.launch {
-            _userProfile.value = TdLibManager.getCurrentUserProfile()
+            _userProfile.value = withContext(Dispatchers.IO) {
+                TdLibManager.getCurrentUserProfile()
+            }
         }
     }
 
     fun logout() {
         viewModelScope.launch {
-            TdLibManager.logout()
+            withContext(Dispatchers.IO) {
+                TdLibManager.logout()
+            }
             _chats.value = emptyList()
             _userProfile.value = null
+            _selectedSourceId.value = null
+            _selectedTargetId.value = null
         }
     }
 
     fun startCloning(context: Context, source: TelegramChatItem, target: TelegramChatItem) {
-        CloneForegroundService.startCloning(
-            context = context,
-            sourceChatId = source.id,
-            sourceTitle = source.title,
-            targetChatId = target.id,
-            targetTitle = target.title,
-        )
+        val currentActive = serviceProgress.value.activeTask ?: activeDbTask.value
+        if (currentActive?.status == CloneTaskStatus.RUNNING) return
+        if (source.id == target.id) return
+
+        val config = _batchModeConfig.value
+        val validation = BatchModeValidator.validate(config)
+        if (!BatchModeValidator.canStartCloning(
+                hasValidSourceAndTarget = true,
+                isTaskRunning = false,
+                config = config,
+                validation = validation,
+            )
+        ) {
+            return
+        }
+
+        if (config.isBatchMode) {
+            val minMs = ((validation.jitterMinSeconds ?: 5.0) * 1000.0).toLong().coerceAtLeast(1L)
+            val maxMs = ((validation.jitterMaxSeconds ?: 8.0) * 1000.0).toLong().coerceAtLeast(minMs)
+            CloneForegroundService.startCloning(
+                context = context,
+                sourceChatId = source.id,
+                sourceTitle = source.title,
+                targetChatId = target.id,
+                targetTitle = target.title,
+                isBatchMode = true,
+                batchBlockSize = validation.blockSize ?: 100,
+                batchJitterMinMs = minMs,
+                batchJitterMaxMs = maxMs,
+                preserveAlbumIntegrity = config.preserveAlbumIntegrity,
+            )
+        } else {
+            CloneForegroundService.startCloning(
+                context = context,
+                sourceChatId = source.id,
+                sourceTitle = source.title,
+                targetChatId = target.id,
+                targetTitle = target.title,
+                isBatchMode = false,
+            )
+        }
     }
 
     fun pauseCloning(context: Context) {
@@ -204,42 +325,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val task = serviceProgress.value.activeTask ?: activeDbTask.value
             if (task != null) {
-                dao.deleteById(task.id)
+                withContext(Dispatchers.IO) {
+                    dao.deleteById(task.id)
+                }
             }
             CloneForegroundService.cancelCloning(context)
         }
     }
 
     fun updateDelaySeconds(value: Float) {
-        viewModelScope.launch { settingsDataStore.updateDelaySeconds(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateDelaySeconds(value) }
     }
 
     fun updateIncludeText(value: Boolean) {
-        viewModelScope.launch { settingsDataStore.updateIncludeText(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateIncludeText(value) }
     }
 
     fun updateIncludePhotos(value: Boolean) {
-        viewModelScope.launch { settingsDataStore.updateIncludePhotos(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateIncludePhotos(value) }
     }
 
     fun updateIncludeVideos(value: Boolean) {
-        viewModelScope.launch { settingsDataStore.updateIncludeVideos(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateIncludeVideos(value) }
     }
 
     fun updateIncludeAudio(value: Boolean) {
-        viewModelScope.launch { settingsDataStore.updateIncludeAudio(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateIncludeAudio(value) }
     }
 
     fun updateIncludeDocuments(value: Boolean) {
-        viewModelScope.launch { settingsDataStore.updateIncludeDocuments(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateIncludeDocuments(value) }
     }
 
     fun updateStripMentionsAndLinks(value: Boolean) {
-        viewModelScope.launch { settingsDataStore.updateStripMentionsAndLinks(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateStripMentionsAndLinks(value) }
     }
 
     fun updateCustomSignature(value: String) {
-        viewModelScope.launch { settingsDataStore.updateCustomSignature(value) }
+        viewModelScope.launch(Dispatchers.IO) { settingsDataStore.updateCustomSignature(value) }
     }
 
     fun refreshCacheSize() {

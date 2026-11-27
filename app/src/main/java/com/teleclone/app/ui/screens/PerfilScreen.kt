@@ -44,7 +44,6 @@ import com.teleclone.app.ui.theme.SurfaceCard
 import com.teleclone.app.ui.theme.SurfaceElevated
 import com.teleclone.app.ui.theme.TextPrimary
 import com.teleclone.app.ui.theme.TextSecondary
-import java.io.File
 
 @Composable
 fun PerfilScreen(
@@ -77,11 +76,11 @@ fun PerfilScreen(
                 .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            val avatarFile = userProfile?.avatarLocalPath?.let { File(it) }?.takeIf { it.exists() }
-            if (avatarFile != null) {
+            val avatarPath = userProfile?.avatarLocalPath?.takeIf { it.isNotBlank() }
+            if (avatarPath != null) {
                 AsyncImage(
-                    model = avatarFile,
-                    contentDescription = userProfile.fullName,
+                    model = avatarPath,
+                    contentDescription = userProfile?.fullName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(84.dp)

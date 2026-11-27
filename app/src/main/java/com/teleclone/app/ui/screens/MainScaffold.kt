@@ -64,6 +64,10 @@ fun MainScaffold(viewModel: MainViewModel) {
     val totalClonedMessages by viewModel.totalClonedMessages.collectAsState()
     val cloneSettings by viewModel.cloneSettings.collectAsState()
     val cacheSizeMb by viewModel.cacheSizeMb.collectAsState()
+    val batchModeConfig by viewModel.batchModeConfig.collectAsState()
+    val batchValidation by viewModel.batchValidation.collectAsState()
+    val selectedSourceId by viewModel.selectedSourceId.collectAsState()
+    val selectedTargetId by viewModel.selectedTargetId.collectAsState()
 
     val tabs = remember {
         listOf(
@@ -155,6 +159,20 @@ fun MainScaffold(viewModel: MainViewModel) {
                     errorMessage = chatsError,
                     serviceProgress = serviceProgress,
                     activeDbTask = activeDbTask,
+                    selectedSourceId = selectedSourceId,
+                    selectedTargetId = selectedTargetId,
+                    batchConfig = batchModeConfig,
+                    batchValidation = batchValidation,
+                    onSelectSource = { viewModel.selectSourceChat(it) },
+                    onSelectTarget = { viewModel.selectTargetChat(it) },
+                    onToggleBatchMode = { viewModel.toggleBatchMode() },
+                    onBatchBlockSizeChange = { viewModel.updateBatchBlockSize(it) },
+                    onBatchJitterMinChange = { viewModel.updateBatchJitterMin(it) },
+                    onBatchJitterMaxChange = { viewModel.updateBatchJitterMax(it) },
+                    onBatchAutoPauseChange = { viewModel.updateBatchAutoPauseFloodWait(it) },
+                    onBatchVariableJitterChange = { viewModel.updateBatchVariableJitter(it) },
+                    onBatchPreserveAlbumChange = { viewModel.updateBatchPreserveAlbumIntegrity(it) },
+                    onBatchRiskAcceptedChange = { viewModel.updateBatchRiskAccepted(it) },
                     onRefreshChats = { viewModel.refreshChats() },
                     onStartCloning = { context, source, target ->
                         viewModel.startCloning(context, source, target)
