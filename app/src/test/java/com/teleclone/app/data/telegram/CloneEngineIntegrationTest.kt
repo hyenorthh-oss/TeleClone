@@ -7,6 +7,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -14,8 +15,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import kotlin.coroutines.EmptyCoroutineContext
-import kotlin.coroutines.suspendCoroutine
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.random.Random
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -82,7 +81,7 @@ class CloneEngineIntegrationTest {
             attempts++
             if (attempts <= 3) {
                 // Simulate infinite hang on TDLib callback
-                suspendCoroutine<Int> { /* never resumes */ }
+                suspendCancellableCoroutine<Int> { /* never resumes */ }
             } else {
                 42
             }
@@ -103,7 +102,7 @@ class CloneEngineIntegrationTest {
                 delayFn = { ms -> delay(ms) },
             ) {
                 attempts++
-                suspendCoroutine { /* never resumes */ }
+                suspendCancellableCoroutine { /* never resumes */ }
             }
             fail("Expected TdLibTimeoutException")
         } catch (e: TdLibTimeoutException) {
