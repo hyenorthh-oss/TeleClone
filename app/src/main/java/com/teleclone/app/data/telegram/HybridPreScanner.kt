@@ -64,8 +64,8 @@ object HybridPreScanner {
 
     private suspend fun <R> runWithReliability(
         timeoutMs: Long,
-        delayFn: suspend (Long) -> Unit,
-        onFloodWaitTick: suspend (Int) -> Unit,
+        delayFn: (suspend (Long) -> Unit)?,
+        onFloodWaitTick: (suspend (Int) -> Unit)?,
         block: suspend () -> R,
     ): R {
         return when (
@@ -87,8 +87,8 @@ object HybridPreScanner {
         targetChatId: Long,
         gateway: HybridScanGateway<T>,
         timeoutMs: Long = CloneReliabilityExecutor.DEFAULT_TIMEOUT_MS,
-        delayFn: suspend (Long) -> Unit = { delay(it) },
-        onFloodWaitTick: suspend (Int) -> Unit = {},
+        delayFn: (suspend (Long) -> Unit)? = null,
+        onFloodWaitTick: (suspend (Int) -> Unit)? = null,
     ): TopicMappingResult {
         val sourceIsForum = runWithReliability(timeoutMs, delayFn, onFloodWaitTick) {
             gateway.isForumSupergroup(sourceChatId)
@@ -162,9 +162,9 @@ object HybridPreScanner {
         settings: CloneSettings,
         gateway: HybridScanGateway<T>,
         timeoutMs: Long = CloneReliabilityExecutor.DEFAULT_TIMEOUT_MS,
-        delayFn: suspend (Long) -> Unit = { delay(it) },
-        onFloodWaitTick: suspend (Int) -> Unit = {},
-        onScanProgress: suspend (scannedSoFar: Int) -> Unit = {},
+        delayFn: (suspend (Long) -> Unit)? = null,
+        onFloodWaitTick: (suspend (Int) -> Unit)? = null,
+        onScanProgress: (suspend (scannedSoFar: Int) -> Unit)? = null,
     ): PreScanResult<T> {
         val topicMapping = mapForumTopics(
             sourceChatId = sourceChatId,
@@ -191,7 +191,7 @@ object HybridPreScanner {
                     break
                 }
                 emptyAttempt++
-                delayFn(HISTORY_CACHE_MISS_DELAY_MS)
+                if (delayFn != null) delayFn(HISTORY_CACHE_MISS_DELAY_MS) else delay(HISTORY_CACHE_MISS_DELAY_MS)
             }
 
             if (page.isEmpty()) break
@@ -208,7 +208,7 @@ object HybridPreScanner {
             if (oldestId == cursorId && !addedNew) break
             if (cursorId > 0L && oldestId >= cursorId) break
             cursorId = oldestId
-            onScanProgress(merged.size)
+            onScanProgress?.invoke(merged.size)
         }
 
         // 2. Complement with server-backed SearchChatMessages across media filters
@@ -225,7 +225,7 @@ object HybridPreScanner {
                 for (msg in res.messages) {
                     merged[msg.id] = msg
                 }
-                onScanProgress(merged.size)
+                onScanProgress?.invoke(merged.size)
 
                 val nextId = res.nextFromMessageId
                 if (nextId == 0L || nextId == searchCursor) break

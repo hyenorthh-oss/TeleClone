@@ -52,13 +52,16 @@ object CloneReliabilityExecutor {
         backoffMs: List<Long> = RETRY_BACKOFF_MS,
         autoHandleFloodWait: Boolean = true,
         skipOnForwardsRestricted: Boolean = true,
-        onFloodWaitTick: suspend (remainingSeconds: Int) -> Unit = {},
-        onRetryAttempt: suspend (attempt: Int, delayMs: Long, error: Throwable) -> Unit = { _, _, _ -> },
-        onRestrictedSkip: (TdLibException) -> Unit = {},
-        delayFn: suspend (Long) -> Unit = { delay(it) },
+        onFloodWaitTick: (suspend (remainingSeconds: Int) -> Unit)? = null,
+        onRetryAttempt: (suspend (attempt: Int, delayMs: Long, error: Throwable) -> Unit)? = null,
+        onRestrictedSkip: ((TdLibException) -> Unit)? = null,
+        delayFn: (suspend (Long) -> Unit)? = null,
         block: suspend () -> T,
     ): ReliabilityOutcome<T> {
         var transientRetryIndex = 0
+        suspend fun pause(ms: Long) {
+            if (delayFn != null) delayFn(ms) else delay(ms)
+        }
 
         while (true) {
             try {
@@ -71,7 +74,7 @@ object CloneReliabilityExecutor {
                 throw e
             } catch (e: TdLibException) {
                 if (skipOnForwardsRestricted && isForwardsRestrictedError(e)) {
-                    onRestrictedSkip(e)
+                    onRestrictedSkip?.invoke(e)
                     return ReliabilityOutcome.RestrictedSkipped(e.message)
                 }
 
@@ -79,8 +82,8 @@ object CloneReliabilityExecutor {
                 if (floodWaitSeconds != null && autoHandleFloodWait) {
                     val totalWait = (floodWaitSeconds + 1).coerceAtLeast(1)
                     for (remaining in totalWait downTo 1) {
-                        onFloodWaitTick(remaining)
-                        delayFn(1_000L)
+                        onFloodWaitTick?.invoke(remaining)
+                        pause(1_000L)
                     }
                     continue
                 }
@@ -88,8 +91,8 @@ object CloneReliabilityExecutor {
                 if (isTransientError(e) && transientRetryIndex < backoffMs.size) {
                     val waitMs = backoffMs[transientRetryIndex]
                     transientRetryIndex++
-                    onRetryAttempt(transientRetryIndex, waitMs, e)
-                    delayFn(waitMs)
+                    onRetryAttempt?.invoke(transientRetryIndex, waitMs, e)
+                    pause(waitMs)
                     continue
                 }
 
@@ -98,8 +101,8 @@ object CloneReliabilityExecutor {
                 if (isTransientError(e) && transientRetryIndex < backoffMs.size) {
                     val waitMs = backoffMs[transientRetryIndex]
                     transientRetryIndex++
-                    onRetryAttempt(transientRetryIndex, waitMs, e)
-                    delayFn(waitMs)
+                    onRetryAttempt?.invoke(transientRetryIndex, waitMs, e)
+                    pause(waitMs)
                     continue
                 }
                 throw e

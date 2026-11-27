@@ -189,7 +189,7 @@ object ConfirmationBarrier {
         gateway: CloneExecutionGateway<T>,
         pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
         drainTimeoutMs: Long = DEFAULT_DRAIN_TIMEOUT_MS,
-        delayFn: suspend (Long) -> Unit = { delay(it) },
+        delayFn: (suspend (Long) -> Unit)? = null,
         elapsedMsProvider: (() -> Long)? = null,
     ): BarrierDrainResult {
         val currentStates = initialHandles.associateBy { it.sourceMessageId }.toMutableMap()
@@ -208,7 +208,7 @@ object ConfirmationBarrier {
             }
             if (pendingHandles.isEmpty()) break
 
-            delayFn(pollIntervalMs)
+            if (delayFn != null) delayFn(pollIntervalMs) else delay(pollIntervalMs)
             simulatedElapsed += pollIntervalMs
 
             for (pending in pendingHandles) {
@@ -285,18 +285,32 @@ class CloneSessionRunner<T>(
     private val pollIntervalMs: Long = ConfirmationBarrier.DEFAULT_POLL_INTERVAL_MS,
     private val drainTimeoutMs: Long = ConfirmationBarrier.DEFAULT_DRAIN_TIMEOUT_MS,
     private val random: Random = Random.Default,
-    private val delayFn: suspend (Long) -> Unit = { delay(it) },
+    private val delayFn: (suspend (Long) -> Unit)? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     private val onTaskUpdated: (CloneTaskEntity) -> Unit = {},
-    private val onProgress: suspend (
+    private val onProgress: (suspend (
         task: CloneTaskEntity,
         statusText: String,
         floodWaitSeconds: Int?,
         isPaused: Boolean,
         forceImmediate: Boolean,
-    ) -> Unit = { _, _, _, _, _ -> },
+    ) -> Unit)? = null,
     private val onLogWarning: (String) -> Unit = {},
 ) {
+
+    private suspend fun pause(ms: Long) {
+        if (delayFn != null) delayFn.invoke(ms) else delay(ms)
+    }
+
+    private suspend fun emitProgress(
+        task: CloneTaskEntity,
+        statusText: String,
+        floodWaitSeconds: Int? = null,
+        isPaused: Boolean = false,
+        forceImmediate: Boolean = false,
+    ) {
+        onProgress?.invoke(task, statusText, floodWaitSeconds, isPaused, forceImmediate)
+    }
 
     suspend fun run(initialTask: CloneTaskEntity): CloneTaskEntity {
         var currentTask = initialTask
@@ -311,7 +325,7 @@ class CloneSessionRunner<T>(
             )
             onTaskUpdated(currentTask)
             store.updateTask(currentTask)
-            onProgress(
+            emitProgress(
                 currentTask,
                 "Contabilizando arquivos e tópicos do canal de origem...",
                 null,
@@ -329,7 +343,7 @@ class CloneSessionRunner<T>(
                 timeoutMs = timeoutMs,
                 delayFn = delayFn,
                 onFloodWaitTick = { remaining ->
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Aguardando limite do Telegram (${remaining}s)...",
                         remaining,
@@ -338,7 +352,7 @@ class CloneSessionRunner<T>(
                     )
                 },
                 onScanProgress = { scanned ->
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Contabilizando arquivos e tópicos ($scanned encontrados)...",
                         null,
@@ -378,7 +392,7 @@ class CloneSessionRunner<T>(
                 }
                 append(")")
             }
-            onProgress(currentTask, summaryText, null, false, true)
+            emitProgress(currentTask, summaryText, null, false, true)
         } else {
             val sentAlready = store.countByStatus(currentTask.id, CloneMessageStatus.SENT)
             val failedAlready = store.countByStatus(currentTask.id, CloneMessageStatus.FAILED_PERMANENT)
@@ -398,7 +412,7 @@ class CloneSessionRunner<T>(
                 timeoutMs = timeoutMs,
                 skipOnForwardsRestricted = false,
                 onFloodWaitTick = { remaining ->
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Aguardando limite do Telegram (${remaining}s)...",
                         remaining,
@@ -429,7 +443,7 @@ class CloneSessionRunner<T>(
         )
         onTaskUpdated(currentTask)
         store.updateStatus(currentTask.id, CloneTaskStatus.VERIFYING, currentTask.updatedAt)
-        onProgress(
+        emitProgress(
             currentTask,
             "Verificando integridade e repescando faltantes...",
             null,
@@ -442,7 +456,7 @@ class CloneSessionRunner<T>(
             val missing = store.getPendingMessages(currentTask.id)
             if (missing.isEmpty()) break
 
-            onProgress(
+            emitProgress(
                 currentTask,
                 "Repescagem automática (rodada $round/2 • ${missing.size} faltantes)...",
                 null,
@@ -487,7 +501,7 @@ class CloneSessionRunner<T>(
         )
         onTaskUpdated(completed)
         store.updateTask(completed)
-        onProgress(completed, "Clonagem Concluída!", null, false, true)
+        emitProgress(completed, "Clonagem Concluída!", null, false, true)
         return completed
     }
 
@@ -515,7 +529,7 @@ class CloneSessionRunner<T>(
                             backoffMs = backoffMs,
                             skipOnForwardsRestricted = false,
                             onFloodWaitTick = { remaining ->
-                                onProgress(
+                                emitProgress(
                                     currentTask,
                                     "Aguardando limite do Telegram (${remaining}s)...",
                                     remaining,
@@ -593,14 +607,14 @@ class CloneSessionRunner<T>(
                         random = random,
                     )
                     val formatted = String.format(Locale.US, "%.1fs", jitterMs / 1000.0)
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Modo Lote (${block.messageCount} msgs) • Pausa jitter: $formatted...",
                         null,
                         false,
                         true,
                     )
-                    if (jitterMs > 0L) delayFn(jitterMs)
+                    if (jitterMs > 0L) pause(jitterMs)
                 }
             }
         } else {
@@ -623,14 +637,14 @@ class CloneSessionRunner<T>(
 
                 if (!isRecoveryPass && idx < calls.lastIndex) {
                     val cadenceMs = (latestSettings.delaySeconds * 1000f).toLong().coerceAtLeast(500L)
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Aguardando cadência (${String.format(Locale.US, "%.1fs", latestSettings.delaySeconds)})...",
                         null,
                         false,
                         false,
                     )
-                    delayFn(cadenceMs)
+                    pause(cadenceMs)
                 }
             }
         }
@@ -671,7 +685,7 @@ class CloneSessionRunner<T>(
             val targetThreadId = remainingItems.first().targetThreadId
             val useProtectedReupload = remainingItems.any { forceProtectedIds.contains(it.id) }
 
-            onProgress(
+            emitProgress(
                 currentTask,
                 when {
                     useProtectedReupload -> "$statusPrefix • Reenvio protegido (${remainingItems.size} itens)..."
@@ -690,7 +704,7 @@ class CloneSessionRunner<T>(
                     backoffMs = backoffMs,
                     skipOnForwardsRestricted = !useProtectedReupload,
                     onFloodWaitTick = { remaining ->
-                        onProgress(
+                        emitProgress(
                             currentTask,
                             "Aguardando limite do Telegram (${remaining}s)...",
                             remaining,
@@ -699,7 +713,7 @@ class CloneSessionRunner<T>(
                         )
                     },
                     onRetryAttempt = { attempt, delayMs, _ ->
-                        onProgress(
+                        emitProgress(
                             currentTask,
                             "Reconectando ($attempt/${backoffMs.size}) em ${delayMs / 1000}s...",
                             null,
@@ -744,14 +758,14 @@ class CloneSessionRunner<T>(
                 if (transientRetryIndex < backoffMs.size && CloneReliabilityExecutor.isTransientError(e)) {
                     val waitMs = backoffMs[transientRetryIndex++]
                     store.incrementAttempt(currentTask.id, remainingIds, e.message ?: "Erro temporário")
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Reenviando faltantes ($transientRetryIndex/${backoffMs.size}) em ${waitMs / 1000}s...",
                         null,
                         false,
                         true,
                     )
-                    delayFn(waitMs)
+                    pause(waitMs)
                     continue
                 }
                 val reason = e.message ?: "Erro ao enviar lote"
@@ -787,7 +801,7 @@ class CloneSessionRunner<T>(
                     drain.confirmedSourceIds.max(),
                     currentTask.lastFailureReason,
                 )
-                onProgress(
+                emitProgress(
                     currentTask,
                     "$statusPrefix • Confirmadas: ${currentTask.clonedCount}/${currentTask.totalFound}",
                     null,
@@ -848,14 +862,14 @@ class CloneSessionRunner<T>(
             if (floodWait != null) {
                 val totalWait = (floodWait + 1).coerceAtLeast(1)
                 for (rem in totalWait downTo 1) {
-                    onProgress(
+                    emitProgress(
                         currentTask,
                         "Aguardando limite do Telegram (${rem}s)...",
                         rem,
                         false,
                         true,
                     )
-                    delayFn(1_000L)
+                    pause(1_000L)
                 }
                 continue
             }
@@ -863,14 +877,14 @@ class CloneSessionRunner<T>(
             if (transientRetryIndex < backoffMs.size) {
                 val waitMs = backoffMs[transientRetryIndex++]
                 store.incrementAttempt(currentTask.id, remainingIds, "Falha parcial no lote; aguardando reenvio")
-                onProgress(
+                emitProgress(
                     currentTask,
                     "Reenviando ${remainingIds.size} faltantes ($transientRetryIndex/${backoffMs.size}) em ${waitMs / 1000}s...",
                     null,
                     false,
                     true,
                 )
-                delayFn(waitMs)
+                pause(waitMs)
             } else {
                 store.incrementAttempt(currentTask.id, remainingIds, "Tentativas do lote esgotadas")
                 currentTask = currentTask.copy(
